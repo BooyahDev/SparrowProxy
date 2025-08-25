@@ -312,6 +312,14 @@ func (p *proxyServer) makeProxy(s *Service) *httputil.ReverseProxy {
 		Director:  p.directorFor(s),
 		Transport: p.transport(),
 		ModifyResponse: func(res *http.Response) error {
+			// プロトコルバージョンを動的に判定してViaヘッダーを設定
+			protoVersion := "1.1"
+			if res.ProtoMajor == 2 {
+				protoVersion = "2"
+			}
+			viaValue := fmt.Sprintf("%s SparrowProxy/0.0.1", protoVersion)
+			res.Header.Set("Via", viaValue)
+			
 			// 成功・失敗の統計更新
 			if res.StatusCode >= 200 && res.StatusCode < 400 {
 				p.successRequests.Add(1)
