@@ -423,7 +423,7 @@ func (p *proxyServer) httpsMux() http.Handler {
 func (p *proxyServer) healthCheckMux() http.Handler {
 	mux := http.NewServeMux()
 
-	mux.HandleFunc("/v2/api/status", func(w http.ResponseWriter, r *http.Request) {
+	mux.HandleFunc("/api/v1/status", func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodGet {
 			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
 			return
