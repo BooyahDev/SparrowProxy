@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/tls"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"flag"
 	"fmt"
@@ -71,6 +72,14 @@ type RedirectRule struct {
 	StatusCode int    `yaml:"status_code"`
 }
 
+type StatsResponse struct {
+	Status          string `json:"status"`
+	TotalRequests   uint64 `json:"total_requests"`
+	SuccessRequests uint64 `json:"success_requests"`
+	FailRequests    uint64 `json:"fail_requests"`
+	Uptime          string `json:"uptime"`
+}
+
 type backend struct {
 	target *url.URL
 	alive  atomic.Bool
@@ -112,12 +121,16 @@ func (l *lb) nextAlive() *backend {
 }
 
 type proxyServer struct {
-	mu          sync.RWMutex
-	cfg         *Config
-	services    []*Service
-	lbs         map[string]*lb
-	certMap     map[string]*tls.Certificate
-	defaultCert *tls.Certificate
+	mu              sync.RWMutex
+	cfg             *Config
+	services        []*Service
+	lbs             map[string]*lb
+	certMap         map[string]*tls.Certificate
+	defaultCert     *tls.Certificate
+	startTime       time.Time
+	totalRequests   atomic.Uint64
+	successRequests atomic.Uint64
+	failRequests    atomic.Uint64
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -299,9 +312,16 @@ func (p *proxyServer) makeProxy(s *Service) *httputil.ReverseProxy {
 		Director:  p.directorFor(s),
 		Transport: p.transport(),
 		ModifyResponse: func(res *http.Response) error {
+			// 成功・失敗の統計更新
+			if res.StatusCode >= 200 && res.StatusCode < 400 {
+				p.successRequests.Add(1)
+			} else {
+				p.failRequests.Add(1)
+			}
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
+			p.failRequests.Add(1)
 			log.Printf("proxy error: %v", err)
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		},
@@ -388,14 +408,58 @@ func (p *proxyServer) httpRedirectMux() http.Handler {
 
 func (p *proxyServer) httpsMux() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		p.totalRequests.Add(1) // 総リクエスト数をカウント
 		s := p.matchService(r.Host, r.URL.Path)
 		if s == nil {
+			p.failRequests.Add(1) // 404の場合は失敗としてカウント
 			http.NotFound(w, r)
 			return
 		}
 		rp := p.makeProxy(s)
 		rp.ServeHTTP(w, r)
 	})
+}
+
+func (p *proxyServer) healthCheckMux() http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/v2/api/status", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet {
+			http.Error(w, "Method Not Allowed", http.StatusMethodNotAllowed)
+			return
+		}
+
+		uptime := time.Since(p.startTime)
+		uptimeStr := p.formatUptime(uptime)
+
+		stats := StatsResponse{
+			Status:          "ok",
+			TotalRequests:   p.totalRequests.Load(),
+			SuccessRequests: p.successRequests.Load(),
+			FailRequests:    p.failRequests.Load(),
+			Uptime:          uptimeStr,
+		}
+
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		json.NewEncoder(w).Encode(stats)
+	})
+
+	return mux
+}
+
+func (p *proxyServer) formatUptime(d time.Duration) string {
+	days := int(d.Hours()) / 24
+	hours := int(d.Hours()) % 24
+	minutes := int(d.Minutes()) % 60
+
+	if days > 0 {
+		return fmt.Sprintf("%d days %d hours %d minutes", days, hours, minutes)
+	} else if hours > 0 {
+		return fmt.Sprintf("%d hours %d minutes", hours, minutes)
+	} else {
+		return fmt.Sprintf("%d minutes", minutes)
+	}
 }
 
 func (p *proxyServer) tlsConfig() *tls.Config {
@@ -468,7 +532,7 @@ func main() {
 		log.Fatal(err)
 	}
 
-	p := &proxyServer{}
+	p := &proxyServer{startTime: time.Now()}
 	if err := p.applyConfig(cfg); err != nil {
 		log.Fatal(err)
 	}
@@ -485,6 +549,14 @@ func main() {
 		srv := &http.Server{Addr: cfg.HTTP.Addr, Handler: p.httpRedirectMux()}
 		log.Printf("HTTP redirect listening on %s", cfg.HTTP.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
+			log.Fatal(err)
+		}
+	}()
+
+	go func() {
+		healthSrv := &http.Server{Addr: ":8000", Handler: p.healthCheckMux()}
+		log.Printf("Health check server listening on :8000")
+		if err := healthSrv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}
 	}()
