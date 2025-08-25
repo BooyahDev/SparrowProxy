@@ -1,0 +1,36 @@
+# SparrowProxy Configuration
+http:
+  addr: ":80"
+
+https:
+  addr: ":443"
+
+# TLS certificates
+tls:
+- sni_hosts:
+  - "example.com"
+  - "*.example.com"
+  cert_path: "/app/certs/example.crt"
+  key_path: "/app/certs/example.key"
+
+# Services configuration
+services:
+- name: "web-service"
+  hosts:
+  - "example.com"
+  - "www.example.com"
+  routes:
+  - "/"
+  upstreams:
+  - url: "http://backend:8080"
+  health_check:
+    path: "/health"
+    interval: "10s"
+    timeout: "5s"
+  pass_host_header: true
+
+# Redirect rules
+redirects:
+- from_host: "old.example.com"
+  to: "https://example.com"
+  status_code: 301

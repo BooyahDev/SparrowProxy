@@ -3,7 +3,6 @@ package main
 import (
 	"context"
 	"crypto/tls"
-	"crypto/x509"
 	"encoding/base64"
 	"errors"
 	"flag"
@@ -21,8 +20,8 @@ import (
 	"sync/atomic"
 	"time"
 
-	"gopkg.in/yaml.v3"
 	"github.com/fsnotify/fsnotify"
+	"gopkg.in/yaml.v3"
 )
 
 type Config struct {
@@ -312,18 +311,26 @@ func (p *proxyServer) makeProxy(s *Service) *httputil.ReverseProxy {
 }
 
 func (p *proxyServer) startHealthChecks(ctx context.Context) {
-	p.mu.RLock(); cfg := p.cfg; p.mu.RUnlock()
+	p.mu.RLock()
+	cfg := p.cfg
+	p.mu.RUnlock()
 	hc := &http.Client{Timeout: 2 * time.Second}
 	for i := range cfg.Services {
 		s := &cfg.Services[i]
 		path := s.HealthCheck.Path
-		if path == "" { path = "/healthz" }
+		if path == "" {
+			path = "/healthz"
+		}
 		interval := s.HealthCheck.Interval
-		if interval == 0 { interval = 5 * time.Second }
+		if interval == 0 {
+			interval = 5 * time.Second
+		}
 		timeout := s.HealthCheck.Timeout
-		if timeout == 0 { timeout = 1 * time.Second }
+		if timeout == 0 {
+			timeout = 1 * time.Second
+		}
 
-		clent := &http.Client{ Timeout: timeout }
+		clent := &http.Client{Timeout: timeout}
 		lb := p.lbs[s.Name]
 
 		go func() {
@@ -334,12 +341,12 @@ func (p *proxyServer) startHealthChecks(ctx context.Context) {
 				case <-ctx.Done():
 					return
 				case <-t.C:
-					for _, b := range lb.backends [
+					for _, b := range lb.backends {
 						u := *b.target
 						u.Path = path
-						ok := checkOnce(client, u.string())
+						ok := checkOnce(clent, u.String())
 						b.alive.Store(ok)
-					]
+					}
 				}
 			}
 		}()
@@ -350,7 +357,9 @@ func (p *proxyServer) startHealthChecks(ctx context.Context) {
 func checkOnce(c *http.Client, url string) bool {
 	req, _ := http.NewRequest("GET", url, nil)
 	resp, err := c.Do(req)
-	if err != nil { return false }
+	if err != nil {
+		return false
+	}
 	io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	return resp.StatusCode >= 200 && resp.StatusCode < 400
@@ -360,11 +369,13 @@ func (p *proxyServer) httpRedirectMux() http.Handler {
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
-		host := string.ToLower(r.Host)
+		host := strings.ToLower(r.Host)
 		for _, rr := range p.cfg.Redirects {
 			if strings.EqualFold(rr.FromHost, host) {
 				code := rr.StatusCode
-				if code == 0 { code = http.StatusMovedPermanently }
+				if code == 0 {
+					code = http.StatusMovedPermanently
+				}
 				http.Redirect(w, r, rr.To, code)
 				return
 			}
@@ -375,8 +386,8 @@ func (p *proxyServer) httpRedirectMux() http.Handler {
 	return mux
 }
 
-func(p *proxyServer) httpsMux() http.Handler {
-	return http.HandleFunc(func(w http.ResponseWriter, r *http.Request) {
+func (p *proxyServer) httpsMux() http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		s := p.matchService(r.Host, r.URL.Path)
 		if s == nil {
 			http.NotFound(w, r)
@@ -392,21 +403,30 @@ func (p *proxyServer) tlsConfig() *tls.Config {
 		MinVersion: tls.VersionTLS12,
 		GetCertificate: func(chi *tls.ClientHelloInfo) (*tls.Certificate, error) {
 			name := strings.ToLower(chi.ServerName)
-			p.mu.RLock(); defer p.mu.RUnlock()
-			if cert, ok := p.certMap[name]; ok { return cert, nil }
-			if p.defaultCert != nil { return p.defaultCert, nil }
+			p.mu.RLock()
+			defer p.mu.RUnlock()
+			if cert, ok := p.certMap[name]; ok {
+				return cert, nil
+			}
+			if p.defaultCert != nil {
+				return p.defaultCert, nil
+			}
 			return nil, errors.New("no certificate available")
 		},
-		NextProtos: []string{"h2", "http/1.1"},
+		NextProtos:         []string{"h2", "http/1.1"},
 		ClientSessionCache: tls.NewLRUClientSessionCache(1024),
 	}
 }
 
 func (p *proxyServer) watchAndReload(path string) error {
 	watcher, err := fsnotify.NewWatcher()
-	if err != nil { return err }
+	if err != nil {
+		return err
+	}
 	dir := filepath.Dir(path)
-	if err := watcher.Add(dir); err != nil { return err }
+	if err := watcher.Add(dir); err != nil {
+		return err
+	}
 
 	go func() {
 		debounce := time.NewTimer(0)
@@ -416,13 +436,21 @@ func (p *proxyServer) watchAndReload(path string) error {
 			case ev := <-watcher.Events:
 				if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 && filepath.Base(ev.Name) == filepath.Base(path) {
 					// debounce
-					if !debounce.Stop() { <-debounce.C }
-					debounce.Reset(300 * time.Millisecond)	
+					if !debounce.Stop() {
+						<-debounce.C
+					}
+					debounce.Reset(300 * time.Millisecond)
 				}
 			case <-debounce.C:
 				cfg, err := loadConfig(path)
-				if err != nil { log.Printf("reload error: %v", err); continue }
-				if err := p.applyConfig(cfg); err != nil { log.Printf("apply error: %v", err); continue }
+				if err != nil {
+					log.Printf("reload error: %v", err)
+					continue
+				}
+				if err := p.applyConfig(cfg); err != nil {
+					log.Printf("apply error: %v", err)
+					continue
+				}
 				log.Printf("config reloaded")
 			}
 		}
@@ -436,33 +464,46 @@ func main() {
 	flag.Parse()
 
 	cfg, err := loadConfig(cfgPath)
-	if err != nil { log.Fatal(err) }
+	if err != nil {
+		log.Fatal(err)
+	}
 
 	p := &proxyServer{}
-	if err := p.applyConfig(cfg); err != nil { log.Fatal(err) }
+	if err := p.applyConfig(cfg); err != nil {
+		log.Fatal(err)
+	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	p.startHealthChecks(ctx)
 
-	if err := p.watchAndReload(cfgPath); err != nil { log.Printf("watch error: %v", err) }
+	if err := p.watchAndReload(cfgPath); err != nil {
+		log.Printf("watch error: %v", err)
+	}
 
 	go func() {
-		srv := &http.Server{ Addr: cfg.HTTP.Addr, Handler: p.httpRedirectMux() }
+		srv := &http.Server{Addr: cfg.HTTP.Addr, Handler: p.httpRedirectMux()}
 		log.Printf("HTTP redirect listening on %s", cfg.HTTP.Addr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			log.Fatal(err)
 		}
 	}()
 
-	httpsSrv := &http.Server{ Addr: cfg.HTTPS.Addr, Handler: p.httpsMux(), TLSConfig: p.tlsConfig() }
+	httpsSrv := &http.Server{Addr: cfg.HTTPS.Addr, Handler: p.httpsMux(), TLSConfig: p.tlsConfig()}
 	log.Printf("HTTPS proxy listening on %s", cfg.HTTPS.Addr)
 	ln, err := net.Listen("tcp", cfg.HTTPS.Addr)
-	if err != nil { log.Fatal(err) }
+	if err != nil {
+		log.Fatal(err)
+	}
 	tlsLn := tls.NewListener(ln, httpsSrv.TLSConfig)
-	if err := httpsSrv.Serve(tlsLn); err != && !errors.Is(err, http.ErrServerClosed) {
+	if err := httpsSrv.Serve(tlsLn); err != nil && !errors.Is(err, http.ErrServerClosed) {
 		log.Fatal(err)
 	}
 }
 
-func getenv(k, d string) string {if v := os.Getenv(k); v != "" { return v }; return d }
+func getenv(k, d string) string {
+	if v := os.Getenv(k); v != "" {
+		return v
+	}
+	return d
+}
