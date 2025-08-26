@@ -201,16 +201,43 @@ func (cs *configSyncer) fallbackClone() error {
 	}
 
 	// Remove any existing directory
-	os.RemoveAll(cs.repoPath)
+	if err := os.RemoveAll(cs.repoPath); err != nil {
+		log.Printf("Warning: failed to remove existing directory: %v", err)
+	}
 
 	// Use system git command with token in URL (like the debug pod)
 	cloneURL := fmt.Sprintf("https://git:%s@github.com/BooyahDev/SparrowProxyConfig.git", token)
-
+	
 	cmd := exec.Command("git", "clone", cloneURL, cs.repoPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-
+	
 	log.Printf("Executing: git clone [REDACTED_URL] %s", cs.repoPath)
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("system git clone failed: %w", err)
+	}
+
+	// Verify the cloned repository
+	if _, err := os.Stat(filepath.Join(cs.repoPath, ".git")); err != nil {
+		return fmt.Errorf("cloned repository does not have .git directory: %w", err)
+	}
+
+	log.Printf("Fallback clone completed successfully")
+	return nil
+}
+
+func (cs *configSyncer) fallbackPull() error {
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		return fmt.Errorf("GITHUB_TOKEN not available for fallback")
+	}
+
+	// Change to repository directory and pull
+	cmd := exec.Command("git", "-C", cs.repoPath, "pull", "origin", "main")
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+	
+	log.Printf("Executing: git -C %s pull origin main", cs.repoPath)
 	return cmd.Run()
 }
 
@@ -291,12 +318,40 @@ func (cs *configSyncer) syncRepo() error {
 		return fmt.Errorf("failed to check repository existence: %w", err)
 	} else {
 		log.Printf("Repository already exists at: %s", cs.repoPath)
+		// Check if it's a valid git repository
+		if _, err := git.PlainOpen(cs.repoPath); err != nil {
+			log.Printf("Existing directory is not a valid git repository: %v", err)
+			log.Printf("Removing invalid repository directory and re-cloning...")
+			
+			// Remove the invalid directory
+			if rmErr := os.RemoveAll(cs.repoPath); rmErr != nil {
+				log.Printf("Failed to remove invalid repository: %v", rmErr)
+			}
+			
+			// Retry clone using fallback method
+			if fallbackErr := cs.fallbackClone(); fallbackErr != nil {
+				log.Printf("Fallback clone failed: %v", fallbackErr)
+				return fmt.Errorf("failed to re-clone repository: %w", fallbackErr)
+			}
+			log.Printf("Successfully re-cloned repository using fallback method")
+			return nil
+		}
 	}
 
 	// Open existing repository
 	repo, err := git.PlainOpen(cs.repoPath)
 	if err != nil {
-		return fmt.Errorf("failed to open repository: %w", err)
+		log.Printf("Failed to open repository even after validation: %v", err)
+		// Last resort: try fallback clone
+		log.Printf("Attempting complete re-clone as last resort...")
+		if rmErr := os.RemoveAll(cs.repoPath); rmErr != nil {
+			log.Printf("Failed to remove directory: %v", rmErr)
+		}
+		if fallbackErr := cs.fallbackClone(); fallbackErr != nil {
+			return fmt.Errorf("all repository access methods failed: %w", err)
+		}
+		log.Printf("Last resort clone succeeded")
+		return nil
 	}
 
 	// Get working tree
@@ -320,7 +375,14 @@ func (cs *configSyncer) syncRepo() error {
 	})
 
 	if err != nil && err != git.NoErrAlreadyUpToDate {
-		return fmt.Errorf("failed to pull repository: %w", err)
+		log.Printf("go-git pull failed: %v", err)
+		log.Printf("Attempting fallback pull using system git...")
+		if fallbackErr := cs.fallbackPull(); fallbackErr != nil {
+			log.Printf("Fallback pull also failed: %v", fallbackErr)
+			return fmt.Errorf("failed to pull repository (both go-git and system git failed): %w", err)
+		}
+		log.Printf("Fallback pull succeeded")
+		return nil
 	}
 
 	// Check if there were changes
