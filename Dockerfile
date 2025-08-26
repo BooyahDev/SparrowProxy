@@ -22,8 +22,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o sparrowproxy main
 # Final stage
 FROM alpine:latest
 
-# Install ca-certificates, wget for healthcheck, and git for repository sync
-RUN apk --no-cache add ca-certificates wget git
+# Install ca-certificates, wget for healthcheck, git for repository sync, and libcap for setcap
+RUN apk --no-cache add ca-certificates wget git libcap
 
 # Create app directory
 WORKDIR /app
@@ -36,6 +36,17 @@ COPY config.yaml .
 
 # Create directories for config and certs
 RUN mkdir -p /app/certs /app/config-repo
+
+# Grant capability to bind to privileged ports (< 1024) without running as root
+RUN setcap CAP_NET_BIND_SERVICE=+eip /app/sparrowproxy
+
+# Create a non-root user for security
+RUN addgroup -g 1001 sparrow && \
+    adduser -D -s /bin/sh -u 1001 -G sparrow sparrow && \
+    chown -R sparrow:sparrow /app
+
+# Switch to non-root user
+USER sparrow
 
 # Expose ports
 EXPOSE 80 443 8000
