@@ -194,6 +194,26 @@ func (cs *configSyncer) setupHTTPAuth() (*githttp.BasicAuth, error) {
 	return auth, nil
 }
 
+func (cs *configSyncer) fallbackClone() error {
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		return fmt.Errorf("GITHUB_TOKEN not available for fallback")
+	}
+
+	// Remove any existing directory
+	os.RemoveAll(cs.repoPath)
+
+	// Use system git command with token in URL (like the debug pod)
+	cloneURL := fmt.Sprintf("https://git:%s@github.com/BooyahDev/SparrowProxyConfig.git", token)
+
+	cmd := exec.Command("git", "clone", cloneURL, cs.repoPath)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	log.Printf("Executing: git clone [REDACTED_URL] %s", cs.repoPath)
+	return cmd.Run()
+}
+
 func (cs *configSyncer) syncRepo() error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
@@ -215,7 +235,10 @@ func (cs *configSyncer) syncRepo() error {
 	}
 
 	// Check if repository already exists
+	log.Printf("Checking if repository exists at: %s", cs.repoPath)
 	if _, err := os.Stat(cs.repoPath); os.IsNotExist(err) {
+		log.Printf("Repository does not exist, will clone from %s", cs.repoURL)
+
 		// Create the target directory with proper permissions
 		if err := os.MkdirAll(cs.repoPath, 0755); err != nil {
 			return fmt.Errorf("failed to create repository directory %s: %w", cs.repoPath, err)
@@ -225,8 +248,12 @@ func (cs *configSyncer) syncRepo() error {
 			log.Printf("Warning: failed to remove empty directory: %v", err)
 		}
 
-		// Clone repository
-		log.Printf("Cloning config repository from %s to %s", cs.repoURL, cs.repoPath)
+		// Clone repository with detailed logging
+		log.Printf("Starting clone operation...")
+		log.Printf("  URL: %s", cs.repoURL)
+		log.Printf("  Target: %s", cs.repoPath)
+		log.Printf("  Auth: Using Personal Access Token")
+
 		_, err := git.PlainClone(cs.repoPath, false, &git.CloneOptions{
 			URL:             cs.repoURL,
 			Auth:            auth,
@@ -235,15 +262,35 @@ func (cs *configSyncer) syncRepo() error {
 		})
 		if err != nil {
 			// More detailed error logging
-			log.Printf("Clone failed - URL: %s, Path: %s, Error: %v", cs.repoURL, cs.repoPath, err)
-			// Try to create directory structure manually for debugging
-			if statErr := os.MkdirAll(cs.repoPath, 0755); statErr != nil {
-				log.Printf("Failed to create directory structure: %v", statErr)
+			log.Printf("CLONE FAILED:")
+			log.Printf("  URL: %s", cs.repoURL)
+			log.Printf("  Path: %s", cs.repoPath)
+			log.Printf("  Error: %v", err)
+			log.Printf("  Error Type: %T", err)
+
+			// Check if directory was created
+			if info, statErr := os.Stat(cs.repoPath); statErr == nil {
+				log.Printf("  Directory exists after failed clone: %v", info.IsDir())
+			} else {
+				log.Printf("  Directory stat error: %v", statErr)
 			}
-			return fmt.Errorf("failed to clone repository: %w", err)
+
+			// Try fallback method using system git command
+			log.Printf("Attempting fallback clone using system git command...")
+			if fallbackErr := cs.fallbackClone(); fallbackErr != nil {
+				log.Printf("Fallback clone also failed: %v", fallbackErr)
+				return fmt.Errorf("failed to clone repository (both go-git and system git failed): %w", err)
+			}
+			log.Printf("Fallback clone succeeded!")
+			return nil
 		}
 		log.Printf("Successfully cloned config repository")
 		return nil
+	} else if err != nil {
+		log.Printf("Error checking repository existence: %v", err)
+		return fmt.Errorf("failed to check repository existence: %w", err)
+	} else {
+		log.Printf("Repository already exists at: %s", cs.repoPath)
 	}
 
 	// Open existing repository
