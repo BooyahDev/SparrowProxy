@@ -273,6 +273,20 @@ func (cs *configSyncer) fallbackPull() error {
 
 		if masterErr := cmdMaster.Run(); masterErr != nil {
 			log.Printf("Pull from master branch also failed: %v", masterErr)
+
+			// Check for repository corruption indicators
+			mainErrStr := err.Error()
+			masterErrStr := masterErr.Error()
+
+			if strings.Contains(mainErrStr, "bad object") ||
+				strings.Contains(masterErrStr, "bad object") ||
+				strings.Contains(mainErrStr, "did not send all necessary objects") ||
+				strings.Contains(masterErrStr, "did not send all necessary objects") ||
+				strings.Contains(mainErrStr, "fatal: couldn't find remote ref") ||
+				strings.Contains(masterErrStr, "fatal: couldn't find remote ref") {
+				return fmt.Errorf("repository corruption detected: pull failed from both main and master branches with corruption indicators: main=%v, master=%v", err, masterErr)
+			}
+
 			return fmt.Errorf("pull failed from both main and master branches: main=%v, master=%v", err, masterErr)
 		}
 		log.Printf("Successfully pulled from master branch")
@@ -280,6 +294,28 @@ func (cs *configSyncer) fallbackPull() error {
 	}
 
 	log.Printf("Successfully pulled from main branch")
+	return nil
+}
+
+func (cs *configSyncer) checkRepositoryHealth() error {
+	// Check if .git directory exists
+	gitDir := filepath.Join(cs.repoPath, ".git")
+	if _, err := os.Stat(gitDir); os.IsNotExist(err) {
+		return fmt.Errorf("repository .git directory missing")
+	}
+
+	// Try to get current HEAD to verify repository integrity
+	cmd := exec.Command("git", "-C", cs.repoPath, "rev-parse", "HEAD")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("repository HEAD verification failed: %w", err)
+	}
+
+	// Check if we can access remote
+	cmd = exec.Command("git", "-C", cs.repoPath, "remote", "-v")
+	if err := cmd.Run(); err != nil {
+		return fmt.Errorf("repository remote verification failed: %w", err)
+	}
+
 	return nil
 }
 
@@ -360,7 +396,27 @@ func (cs *configSyncer) syncRepo() error {
 		return fmt.Errorf("failed to check repository existence: %w", err)
 	} else {
 		log.Printf("Repository already exists at: %s", cs.repoPath)
-		// Check if it's a valid git repository
+
+		// Perform comprehensive repository health check
+		if healthErr := cs.checkRepositoryHealth(); healthErr != nil {
+			log.Printf("Repository health check failed: %v", healthErr)
+			log.Printf("Repository appears corrupted, performing complete re-clone...")
+
+			// Remove the corrupted directory
+			if rmErr := os.RemoveAll(cs.repoPath); rmErr != nil {
+				log.Printf("Failed to remove corrupted repository: %v", rmErr)
+			}
+
+			// Retry clone using fallback method
+			if fallbackErr := cs.fallbackClone(); fallbackErr != nil {
+				log.Printf("Fallback clone failed: %v", fallbackErr)
+				return fmt.Errorf("failed to re-clone corrupted repository: %w", fallbackErr)
+			}
+			log.Printf("Successfully re-cloned repository after health check failure")
+			return nil
+		}
+
+		// Check if it's a valid git repository (secondary check)
 		if _, err := git.PlainOpen(cs.repoPath); err != nil {
 			log.Printf("Existing directory is not a valid git repository: %v", err)
 			log.Printf("Removing invalid repository directory and re-cloning...")
@@ -432,9 +488,43 @@ func (cs *configSyncer) syncRepo() error {
 
 	if err != nil && err != git.NoErrAlreadyUpToDate {
 		log.Printf("go-git pull failed (branch: %s): %v", branchName, err)
+
+		// Check if it's a repository corruption issue
+		isCorruption := strings.Contains(err.Error(), "reference has changed concurrently") ||
+			strings.Contains(err.Error(), "bad object") ||
+			strings.Contains(err.Error(), "did not send all necessary objects")
+
+		if isCorruption {
+			log.Printf("Repository corruption detected, performing complete re-clone...")
+			if recloneErr := cs.fallbackClone(); recloneErr != nil {
+				log.Printf("Complete re-clone failed: %v", recloneErr)
+				return fmt.Errorf("failed to recover corrupted repository: %w", recloneErr)
+			}
+			log.Printf("Repository successfully re-cloned")
+			return nil
+		}
+
 		log.Printf("Attempting fallback pull using system git...")
 		if fallbackErr := cs.fallbackPull(); fallbackErr != nil {
 			log.Printf("Fallback pull also failed: %v", fallbackErr)
+
+			// Check if fallback pull also indicates corruption
+			fallbackErrStr := fallbackErr.Error()
+			isCorruptionFallback := strings.Contains(fallbackErrStr, "bad object") ||
+				strings.Contains(fallbackErrStr, "did not send all necessary objects") ||
+				strings.Contains(fallbackErrStr, "corrupted") ||
+				strings.Contains(fallbackErrStr, "fatal:")
+
+			if isCorruptionFallback {
+				log.Printf("System git also indicates repository corruption, performing complete re-clone...")
+				if recloneErr := cs.fallbackClone(); recloneErr != nil {
+					log.Printf("Complete re-clone failed: %v", recloneErr)
+					return fmt.Errorf("failed to recover corrupted repository after all attempts: %w", recloneErr)
+				}
+				log.Printf("Repository successfully re-cloned after corruption")
+				return nil
+			}
+
 			return fmt.Errorf("failed to pull repository (both go-git and system git failed): %w", err)
 		}
 		log.Printf("Fallback pull succeeded")
