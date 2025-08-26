@@ -15,6 +15,7 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -149,11 +150,40 @@ func newConfigSyncer(repoURL, repoPath string) *configSyncer {
 	}
 }
 
+func (cs *configSyncer) setupGitConfig() error {
+	// Set up git configuration if not already done
+	homeDir := os.Getenv("HOME")
+	if homeDir == "" {
+		homeDir = "/tmp"
+	}
+
+	// Configure git globally
+	commands := [][]string{
+		{"git", "config", "--global", "user.email", "sparrowproxy@booyah.dev"},
+		{"git", "config", "--global", "user.name", "SparrowProxy"},
+		{"git", "config", "--global", "init.defaultBranch", "main"},
+		{"git", "config", "--global", "--add", "safe.directory", cs.repoPath},
+	}
+
+	for _, cmd := range commands {
+		if err := exec.Command(cmd[0], cmd[1:]...).Run(); err != nil {
+			log.Printf("Warning: Git config command failed: %v", err)
+			// Continue even if git config fails - it's not critical
+		}
+	}
+
+	log.Printf("Git configuration completed")
+	return nil
+}
+
 func (cs *configSyncer) setupHTTPAuth() (*githttp.BasicAuth, error) {
 	token := os.Getenv("GITHUB_TOKEN")
 	if token == "" {
 		return nil, fmt.Errorf("GITHUB_TOKEN environment variable is not set")
 	}
+
+	// Log token length for debugging (without exposing the actual token)
+	log.Printf("Using HTTPS authentication with Personal Access Token (length: %d)", len(token))
 
 	// GitHub Personal Access Tokenを使用したHTTPS認証
 	auth := &githttp.BasicAuth{
@@ -161,7 +191,6 @@ func (cs *configSyncer) setupHTTPAuth() (*githttp.BasicAuth, error) {
 		Password: token,
 	}
 
-	log.Printf("Using HTTPS authentication with Personal Access Token")
 	return auth, nil
 }
 
@@ -169,16 +198,31 @@ func (cs *configSyncer) syncRepo() error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
+	// Setup git configuration first
+	if err := cs.setupGitConfig(); err != nil {
+		log.Printf("Warning: Git configuration failed: %v", err)
+	}
+
 	auth, err := cs.setupHTTPAuth()
 	if err != nil {
 		return fmt.Errorf("HTTP auth setup failed: %w", err)
 	}
 
+	// Ensure parent directory exists with proper permissions
+	parentDir := filepath.Dir(cs.repoPath)
+	if err := os.MkdirAll(parentDir, 0755); err != nil {
+		return fmt.Errorf("failed to create parent directory %s: %w", parentDir, err)
+	}
+
 	// Check if repository already exists
 	if _, err := os.Stat(cs.repoPath); os.IsNotExist(err) {
-		// Ensure parent directory exists
-		if err := os.MkdirAll(filepath.Dir(cs.repoPath), 0755); err != nil {
-			return fmt.Errorf("failed to create parent directory: %w", err)
+		// Create the target directory with proper permissions
+		if err := os.MkdirAll(cs.repoPath, 0755); err != nil {
+			return fmt.Errorf("failed to create repository directory %s: %w", cs.repoPath, err)
+		}
+		// Remove the empty directory so git.PlainClone can create it
+		if err := os.Remove(cs.repoPath); err != nil {
+			log.Printf("Warning: failed to remove empty directory: %v", err)
 		}
 
 		// Clone repository
@@ -188,11 +232,14 @@ func (cs *configSyncer) syncRepo() error {
 			Auth:            auth,
 			Progress:        os.Stdout,
 			InsecureSkipTLS: false,
-			CABundle:        []byte{},
 		})
 		if err != nil {
 			// More detailed error logging
 			log.Printf("Clone failed - URL: %s, Path: %s, Error: %v", cs.repoURL, cs.repoPath, err)
+			// Try to create directory structure manually for debugging
+			if statErr := os.MkdirAll(cs.repoPath, 0755); statErr != nil {
+				log.Printf("Failed to create directory structure: %v", statErr)
+			}
 			return fmt.Errorf("failed to clone repository: %w", err)
 		}
 		log.Printf("Successfully cloned config repository")
@@ -772,6 +819,12 @@ func main() {
 	// Start config repository syncing if URL is provided
 	if configRepoURL != "" {
 		log.Printf("Starting config repository sync from %s every %v", configRepoURL, syncInterval)
+
+		// Ensure the config repository directory structure exists
+		if err := os.MkdirAll(filepath.Dir(configRepoPath), 0755); err != nil {
+			log.Printf("Warning: Failed to create config repo parent directory: %v", err)
+		}
+
 		syncer := newConfigSyncer(configRepoURL, configRepoPath)
 
 		go syncer.startPeriodicSync(ctx, syncInterval, func() {
