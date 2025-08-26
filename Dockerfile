@@ -31,6 +31,9 @@ WORKDIR /app
 # Copy the binary from builder stage
 COPY --from=builder /app/sparrowproxy .
 
+# Copy the default config file
+COPY config.yaml .
+
 # Create directories for config and certs
 RUN mkdir -p /app/certs /app/config-repo
 
