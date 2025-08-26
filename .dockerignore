@@ -1,6 +1,31 @@
+# Git
 .git
 .gitignore
+
+# Documentation
 README.md
-docker-compose.yml
-.dockerignore
 *.md
+
+# Docker
+.dockerignore
+docker-compose.yml
+
+# Kubernetes manifests
+k8s-*.yaml
+
+# GitHub Actions
+.github/
+
+# Development files
+config.yaml
+certs/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db

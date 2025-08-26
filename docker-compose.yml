@@ -10,15 +10,23 @@ services:
     ports:
       - "80:80"     # HTTP port
       - "443:443"   # HTTPS port
+      - "8000:8000" # Health check API port
     volumes:
       - ./config.yaml:/app/config.yaml:ro
       - ./certs:/app/certs:ro
+      # SSH keys for Git repository access (optional)
+      - ~/.ssh:/root/.ssh:ro
+      # Volume for Git repository cache
+      - sparrowproxy-config:/app/config-repo
     environment:
       - CONFIG_PATH=/app/config.yaml
+      # Git repository configuration (uncomment and configure as needed)
+      # - CONFIG_REPO_URL=git@github.com:BooyahDev/SparrowProxyConfig.git
+      # - CONFIG_REPO_PATH=/app/config-repo
     networks:
       - sparrowproxy-network
     healthcheck:
-      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:80/healthz"]
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:8000/api/v1/status"]
       interval: 30s
       timeout: 10s
       retries: 3
@@ -27,3 +35,7 @@ services:
 networks:
   sparrowproxy-network:
     driver: bridge
+
+volumes:
+  sparrowproxy-config:
+    driver: local

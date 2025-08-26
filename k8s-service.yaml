@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: sparrowproxy-service
+  namespace: default
+  labels:
+    app: sparrowproxy
+spec:
+  type: LoadBalancer # 開発環境用、必要に応じてNodePortやClusterIPに変更
+  ports:
+  - name: http
+    port: 80
+    targetPort: 80
+    protocol: TCP
+  - name: https
+    port: 443
+    targetPort: 443
+    protocol: TCP
+  - name: health
+    port: 8000
+    targetPort: 8000
+    protocol: TCP
+  selector:
+    app: sparrowproxy
+  sessionAffinity: None

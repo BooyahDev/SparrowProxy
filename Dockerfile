@@ -22,8 +22,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o sparrowproxy main
 # Final stage
 FROM alpine:latest
 
-# Install ca-certificates and wget for healthcheck
-RUN apk --no-cache add ca-certificates wget
+# Install ca-certificates, wget for healthcheck, git for repository sync, and openssh for SSH key support
+RUN apk --no-cache add ca-certificates wget git openssh-client
 
 # Create app directory
 WORKDIR /app
@@ -32,13 +32,14 @@ WORKDIR /app
 COPY --from=builder /app/sparrowproxy .
 
 # Create directories for config and certs
-RUN mkdir -p /app/certs
+RUN mkdir -p /app/certs /app/config-repo
 
 # Expose ports
-EXPOSE 80 443
+EXPOSE 80 443 8000
 
 # Set default environment variables
 ENV CONFIG_PATH=/app/config.yaml
+ENV CONFIG_REPO_PATH=/app/config-repo
 
 # Run the application
 CMD ["./sparrowproxy"]

@@ -22,6 +22,8 @@ import (
 	"time"
 
 	"github.com/fsnotify/fsnotify"
+	"github.com/go-git/go-git/v5"
+	"github.com/go-git/go-git/v5/plumbing/transport/ssh"
 	"gopkg.in/yaml.v3"
 )
 
@@ -131,6 +133,143 @@ type proxyServer struct {
 	totalRequests   atomic.Uint64
 	successRequests atomic.Uint64
 	failRequests    atomic.Uint64
+	configRepoURL   string
+	configRepoPath  string
+}
+
+type configSyncer struct {
+	repoURL    string
+	repoPath   string
+	sshKeyPath string
+	mu         sync.Mutex
+}
+
+func newConfigSyncer(repoURL, repoPath string) *configSyncer {
+	return &configSyncer{
+		repoURL:  repoURL,
+		repoPath: repoPath,
+	}
+}
+
+func (cs *configSyncer) setupSSHAuth() (*ssh.PublicKeys, error) {
+	sshPath := filepath.Join(os.Getenv("HOME"), ".ssh")
+	keyFiles := []string{
+		filepath.Join(sshPath, "id_rsa"),
+		filepath.Join(sshPath, "id_ed25519"),
+		filepath.Join(sshPath, "id_ecdsa"),
+	}
+
+	for _, keyFile := range keyFiles {
+		if _, err := os.Stat(keyFile); err == nil {
+			publicKeys, err := ssh.NewPublicKeysFromFile("git", keyFile, "")
+			if err != nil {
+				log.Printf("Failed to load SSH key %s: %v", keyFile, err)
+				continue
+			}
+			return publicKeys, nil
+		}
+	}
+	return nil, fmt.Errorf("no SSH keys found in %s", sshPath)
+}
+
+func (cs *configSyncer) syncRepo() error {
+	cs.mu.Lock()
+	defer cs.mu.Unlock()
+
+	auth, err := cs.setupSSHAuth()
+	if err != nil {
+		return fmt.Errorf("SSH auth setup failed: %w", err)
+	}
+
+	// Check if repository already exists
+	if _, err := os.Stat(cs.repoPath); os.IsNotExist(err) {
+		// Clone repository
+		log.Printf("Cloning config repository from %s to %s", cs.repoURL, cs.repoPath)
+		_, err := git.PlainClone(cs.repoPath, false, &git.CloneOptions{
+			URL:      cs.repoURL,
+			Auth:     auth,
+			Progress: os.Stdout,
+		})
+		if err != nil {
+			return fmt.Errorf("failed to clone repository: %w", err)
+		}
+		log.Printf("Successfully cloned config repository")
+		return nil
+	}
+
+	// Open existing repository
+	repo, err := git.PlainOpen(cs.repoPath)
+	if err != nil {
+		return fmt.Errorf("failed to open repository: %w", err)
+	}
+
+	// Get working tree
+	worktree, err := repo.Worktree()
+	if err != nil {
+		return fmt.Errorf("failed to get worktree: %w", err)
+	}
+
+	// Get current head before pull
+	ref, err := repo.Head()
+	if err != nil {
+		return fmt.Errorf("failed to get HEAD: %w", err)
+	}
+	oldHash := ref.Hash()
+
+	// Pull latest changes
+	err = worktree.Pull(&git.PullOptions{
+		Auth:         auth,
+		RemoteName:   "origin",
+		SingleBranch: true,
+	})
+
+	if err != nil && err != git.NoErrAlreadyUpToDate {
+		return fmt.Errorf("failed to pull repository: %w", err)
+	}
+
+	// Check if there were changes
+	newRef, err := repo.Head()
+	if err != nil {
+		return fmt.Errorf("failed to get new HEAD: %w", err)
+	}
+	newHash := newRef.Hash()
+
+	if oldHash != newHash {
+		log.Printf("Repository updated from %s to %s", oldHash.String()[:8], newHash.String()[:8])
+		return nil
+	}
+
+	if err == git.NoErrAlreadyUpToDate {
+		log.Printf("Repository is already up to date")
+	}
+
+	return nil
+}
+
+func (cs *configSyncer) startPeriodicSync(ctx context.Context, interval time.Duration, callback func()) {
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+
+	// Initial sync
+	if err := cs.syncRepo(); err != nil {
+		log.Printf("Initial config sync failed: %v", err)
+	} else if callback != nil {
+		callback()
+	}
+
+	for {
+		select {
+		case <-ctx.Done():
+			log.Printf("Stopping config sync")
+			return
+		case <-ticker.C:
+			if err := cs.syncRepo(); err != nil {
+				log.Printf("Config sync failed: %v", err)
+			} else if callback != nil {
+				callback()
+			}
+		}
+	}
 }
 
 func loadConfig(path string) (*Config, error) {
@@ -149,6 +288,37 @@ func loadConfig(path string) (*Config, error) {
 		c.HTTPS.Addr = ":443"
 	}
 	return &c, nil
+}
+
+func (p *proxyServer) loadConfigFromRepo() error {
+	configPath := filepath.Join(p.configRepoPath, "config.yaml")
+
+	// Check if config file exists in the synced repository
+	if _, err := os.Stat(configPath); os.IsNotExist(err) {
+		return fmt.Errorf("config.yaml not found in repository: %s", configPath)
+	}
+
+	cfg, err := loadConfig(configPath)
+	if err != nil {
+		return fmt.Errorf("failed to load config from repository: %w", err)
+	}
+
+	// Update certificate paths to point to the synced repository
+	for i := range cfg.TLS {
+		if cfg.TLS[i].CertPath != "" && !filepath.IsAbs(cfg.TLS[i].CertPath) {
+			cfg.TLS[i].CertPath = filepath.Join(p.configRepoPath, cfg.TLS[i].CertPath)
+		}
+		if cfg.TLS[i].KeyPath != "" && !filepath.IsAbs(cfg.TLS[i].KeyPath) {
+			cfg.TLS[i].KeyPath = filepath.Join(p.configRepoPath, cfg.TLS[i].KeyPath)
+		}
+	}
+
+	if err := p.applyConfig(cfg); err != nil {
+		return fmt.Errorf("failed to apply config from repository: %w", err)
+	}
+
+	log.Printf("Successfully loaded and applied config from repository")
+	return nil
 }
 
 func (p *proxyServer) applyConfig(c *Config) error {
@@ -495,9 +665,26 @@ func (p *proxyServer) watchAndReload(path string) error {
 	if err != nil {
 		return err
 	}
-	dir := filepath.Dir(path)
-	if err := watcher.Add(dir); err != nil {
-		return err
+
+	// Watch both the original config file and the repository config file
+	watchPaths := []string{filepath.Dir(path)}
+	if p.configRepoPath != "" {
+		repoConfigDir := filepath.Dir(filepath.Join(p.configRepoPath, "config.yaml"))
+		watchPaths = append(watchPaths, repoConfigDir)
+
+		// Watch certs directory in repository if it exists
+		certsDirPath := filepath.Join(p.configRepoPath, "certs")
+		if _, err := os.Stat(certsDirPath); err == nil {
+			watchPaths = append(watchPaths, certsDirPath)
+		}
+	}
+
+	for _, watchPath := range watchPaths {
+		if err := watcher.Add(watchPath); err != nil {
+			log.Printf("Failed to watch %s: %v", watchPath, err)
+		} else {
+			log.Printf("Watching directory: %s", watchPath)
+		}
 	}
 
 	go func() {
@@ -506,24 +693,43 @@ func (p *proxyServer) watchAndReload(path string) error {
 		for {
 			select {
 			case ev := <-watcher.Events:
-				if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 && filepath.Base(ev.Name) == filepath.Base(path) {
-					// debounce
-					if !debounce.Stop() {
-						<-debounce.C
+				if ev.Op&(fsnotify.Write|fsnotify.Create|fsnotify.Rename) != 0 {
+					// Check if it's a config file or certificate file
+					fileName := filepath.Base(ev.Name)
+					isConfigFile := fileName == "config.yaml"
+					isCertFile := strings.HasSuffix(fileName, ".pem") || strings.HasSuffix(fileName, ".crt") || strings.HasSuffix(fileName, ".key")
+
+					if isConfigFile || isCertFile {
+						log.Printf("Detected change in %s", ev.Name)
+						// debounce
+						if !debounce.Stop() {
+							<-debounce.C
+						}
+						debounce.Reset(300 * time.Millisecond)
 					}
-					debounce.Reset(300 * time.Millisecond)
 				}
 			case <-debounce.C:
-				cfg, err := loadConfig(path)
-				if err != nil {
-					log.Printf("reload error: %v", err)
-					continue
+				// Try to reload from repository first, then fallback to local config
+				var reloadErr error
+				if p.configRepoPath != "" {
+					reloadErr = p.loadConfigFromRepo()
 				}
-				if err := p.applyConfig(cfg); err != nil {
-					log.Printf("apply error: %v", err)
-					continue
+
+				if reloadErr != nil {
+					log.Printf("Failed to reload from repository, trying local config: %v", reloadErr)
+					cfg, err := loadConfig(path)
+					if err != nil {
+						log.Printf("Local config reload error: %v", err)
+						continue
+					}
+					if err := p.applyConfig(cfg); err != nil {
+						log.Printf("Local config apply error: %v", err)
+						continue
+					}
+					log.Printf("Local config reloaded")
+				} else {
+					log.Printf("Repository config reloaded")
 				}
-				log.Printf("config reloaded")
 			}
 		}
 	}()
@@ -532,21 +738,50 @@ func (p *proxyServer) watchAndReload(path string) error {
 
 func main() {
 	var cfgPath string
+	var configRepoURL string
+	var configRepoPath string
+	var syncInterval time.Duration
+
 	flag.StringVar(&cfgPath, "config", getenv("CONFIG_PATH", "./config.yaml"), "config file path")
+	flag.StringVar(&configRepoURL, "config-repo", getenv("CONFIG_REPO_URL", ""), "config repository URL (e.g., git@github.com:user/repo.git)")
+	flag.StringVar(&configRepoPath, "config-repo-path", getenv("CONFIG_REPO_PATH", "./config-repo"), "local path to clone config repository")
+	flag.DurationVar(&syncInterval, "sync-interval", time.Minute, "interval for syncing config repository")
 	flag.Parse()
 
+	// Load initial config from local file
 	cfg, err := loadConfig(cfgPath)
 	if err != nil {
 		log.Fatal(err)
 	}
 
-	p := &proxyServer{startTime: time.Now()}
+	p := &proxyServer{
+		startTime:      time.Now(),
+		configRepoURL:  configRepoURL,
+		configRepoPath: configRepoPath,
+	}
+
 	if err := p.applyConfig(cfg); err != nil {
 		log.Fatal(err)
 	}
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
+
+	// Start config repository syncing if URL is provided
+	if configRepoURL != "" {
+		log.Printf("Starting config repository sync from %s every %v", configRepoURL, syncInterval)
+		syncer := newConfigSyncer(configRepoURL, configRepoPath)
+
+		go syncer.startPeriodicSync(ctx, syncInterval, func() {
+			// Callback function called after successful sync
+			if err := p.loadConfigFromRepo(); err != nil {
+				log.Printf("Failed to reload config after sync: %v", err)
+			}
+		})
+	} else {
+		log.Printf("No config repository URL provided, using local config only")
+	}
+
 	p.startHealthChecks(ctx)
 
 	if err := p.watchAndReload(cfgPath); err != nil {

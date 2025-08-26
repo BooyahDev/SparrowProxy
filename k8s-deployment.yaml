@@ -1,0 +1,89 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: sparrowproxy
+  namespace: default
+  labels:
+    app: sparrowproxy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: sparrowproxy
+  template:
+    metadata:
+      labels:
+        app: sparrowproxy
+    spec:
+      containers:
+      - name: sparrowproxy
+        # GitHub Actionsでビルド・プッシュされるイメージ
+        image: docker-registry.booyah.dev/sparrowproxy:latest
+        imagePullPolicy: Always
+        ports:
+        - containerPort: 80
+          name: http
+          protocol: TCP
+        - containerPort: 443
+          name: https
+          protocol: TCP
+        - containerPort: 8000
+          name: health
+          protocol: TCP
+        env:
+        - name: CONFIG_REPO_URL
+          value: "git@github.com:BooyahDev/SparrowProxyConfig.git"
+        - name: CONFIG_REPO_PATH
+          value: "/app/config-repo"
+        volumeMounts:
+        - name: ssh-key
+          mountPath: /root/.ssh/id_ed25519
+          subPath: ssh-private-key
+          readOnly: true
+        - name: ssh-config
+          mountPath: /root/.ssh/known_hosts
+          subPath: known_hosts
+          readOnly: true
+        - name: config-repo-volume
+          mountPath: /app/config-repo
+        # リソース制限（開発環境用）
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        # ヘルスチェック
+        livenessProbe:
+          httpGet:
+            path: /api/v1/status
+            port: 8000
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          httpGet:
+            path: /api/v1/status
+            port: 8000
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+      volumes:
+      - name: ssh-key
+        secret:
+          secretName: sparrowproxy-config
+          defaultMode: 600
+      - name: ssh-config
+        secret:
+          secretName: sparrowproxy-ssh-config
+          defaultMode: 644
+      - name: config-repo-volume
+        emptyDir: {}
+      # セキュリティ設定
+      securityContext:
+        runAsNonRoot: false # SSH設定のためrootで実行
+        runAsUser: 0
+      restartPolicy: Always
