@@ -71,7 +71,7 @@ spec:
       - name: ssh-key
         secret:
           secretName: sparrowproxy-config
-          defaultMode: 600
+          defaultMode: 0600
       - name: config-repo-volume
         emptyDir: {}
       # セキュリティ設定
