@@ -23,7 +23,7 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o sparrowproxy main
 FROM alpine:latest
 
 # Install ca-certificates, wget for healthcheck, git for repository sync, and libcap for setcap
-RUN apk --no-cache add ca-certificates wget git libcap
+RUN apk --no-cache add ca-certificates wget git libcap curl
 
 # Create app directory
 WORKDIR /app
