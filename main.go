@@ -157,11 +157,10 @@ func (cs *configSyncer) setupGitConfig() error {
 		homeDir = "/tmp"
 	}
 
-	// Configure git globally
+	// Configure git globally (removed init.defaultBranch to let git use repository's default)
 	commands := [][]string{
 		{"git", "config", "--global", "user.email", "sparrowproxy@booyah.dev"},
 		{"git", "config", "--global", "user.name", "SparrowProxy"},
-		{"git", "config", "--global", "init.defaultBranch", "main"},
 		{"git", "config", "--global", "--add", "safe.directory", cs.repoPath},
 	}
 
@@ -207,11 +206,11 @@ func (cs *configSyncer) fallbackClone() error {
 
 	// Use system git command with token in URL (like the debug pod)
 	cloneURL := fmt.Sprintf("https://git:%s@github.com/BooyahDev/SparrowProxyConfig.git", token)
-	
+
 	cmd := exec.Command("git", "clone", cloneURL, cs.repoPath)
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	
+
 	log.Printf("Executing: git clone [REDACTED_URL] %s", cs.repoPath)
 	if err := cmd.Run(); err != nil {
 		return fmt.Errorf("system git clone failed: %w", err)
@@ -222,7 +221,31 @@ func (cs *configSyncer) fallbackClone() error {
 		return fmt.Errorf("cloned repository does not have .git directory: %w", err)
 	}
 
+	// Detect and set the default branch
+	if err := cs.detectAndSetDefaultBranch(); err != nil {
+		log.Printf("Warning: failed to detect default branch: %v", err)
+	}
+
 	log.Printf("Fallback clone completed successfully")
+	return nil
+}
+
+func (cs *configSyncer) detectAndSetDefaultBranch() error {
+	// Check which branch we're currently on
+	cmd := exec.Command("git", "-C", cs.repoPath, "branch", "--show-current")
+	output, err := cmd.Output()
+	if err != nil {
+		return fmt.Errorf("failed to get current branch: %w", err)
+	}
+
+	currentBranch := strings.TrimSpace(string(output))
+	log.Printf("Repository default branch detected: %s", currentBranch)
+
+	// If it's not main, we might need to handle this in pull operations
+	if currentBranch != "main" && currentBranch != "master" {
+		log.Printf("Warning: Unexpected default branch '%s', will try main/master during pulls", currentBranch)
+	}
+
 	return nil
 }
 
@@ -232,13 +255,32 @@ func (cs *configSyncer) fallbackPull() error {
 		return fmt.Errorf("GITHUB_TOKEN not available for fallback")
 	}
 
-	// Change to repository directory and pull
+	// Try main branch first
+	log.Printf("Executing: git -C %s pull origin main", cs.repoPath)
 	cmd := exec.Command("git", "-C", cs.repoPath, "pull", "origin", "main")
 	cmd.Stdout = os.Stdout
 	cmd.Stderr = os.Stderr
-	
-	log.Printf("Executing: git -C %s pull origin main", cs.repoPath)
-	return cmd.Run()
+
+	if err := cmd.Run(); err != nil {
+		log.Printf("Pull from main branch failed: %v", err)
+		log.Printf("Attempting pull from master branch...")
+
+		// Try master branch as fallback
+		log.Printf("Executing: git -C %s pull origin master", cs.repoPath)
+		cmdMaster := exec.Command("git", "-C", cs.repoPath, "pull", "origin", "master")
+		cmdMaster.Stdout = os.Stdout
+		cmdMaster.Stderr = os.Stderr
+
+		if masterErr := cmdMaster.Run(); masterErr != nil {
+			log.Printf("Pull from master branch also failed: %v", masterErr)
+			return fmt.Errorf("pull failed from both main and master branches: main=%v, master=%v", err, masterErr)
+		}
+		log.Printf("Successfully pulled from master branch")
+		return nil
+	}
+
+	log.Printf("Successfully pulled from main branch")
+	return nil
 }
 
 func (cs *configSyncer) syncRepo() error {
@@ -322,12 +364,12 @@ func (cs *configSyncer) syncRepo() error {
 		if _, err := git.PlainOpen(cs.repoPath); err != nil {
 			log.Printf("Existing directory is not a valid git repository: %v", err)
 			log.Printf("Removing invalid repository directory and re-cloning...")
-			
+
 			// Remove the invalid directory
 			if rmErr := os.RemoveAll(cs.repoPath); rmErr != nil {
 				log.Printf("Failed to remove invalid repository: %v", rmErr)
 			}
-			
+
 			// Retry clone using fallback method
 			if fallbackErr := cs.fallbackClone(); fallbackErr != nil {
 				log.Printf("Fallback clone failed: %v", fallbackErr)
@@ -368,14 +410,28 @@ func (cs *configSyncer) syncRepo() error {
 	oldHash := ref.Hash()
 
 	// Pull latest changes
+	// First, try to determine the current branch
+	head, err := repo.Head()
+	if err != nil {
+		return fmt.Errorf("failed to get current HEAD reference: %w", err)
+	}
+
+	// Extract branch name from the reference
+	branchName := "main" // default fallback
+	if head.Name().IsBranch() {
+		branchName = head.Name().Short()
+	}
+	log.Printf("Attempting to pull from branch: %s", branchName)
+
 	err = worktree.Pull(&git.PullOptions{
-		Auth:         auth,
-		RemoteName:   "origin",
-		SingleBranch: true,
+		Auth:          auth,
+		RemoteName:    "origin",
+		SingleBranch:  true,
+		ReferenceName: head.Name(), // Use the current branch reference
 	})
 
 	if err != nil && err != git.NoErrAlreadyUpToDate {
-		log.Printf("go-git pull failed: %v", err)
+		log.Printf("go-git pull failed (branch: %s): %v", branchName, err)
 		log.Printf("Attempting fallback pull using system git...")
 		if fallbackErr := cs.fallbackPull(); fallbackErr != nil {
 			log.Printf("Fallback pull also failed: %v", fallbackErr)
