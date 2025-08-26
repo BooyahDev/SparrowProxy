@@ -65,6 +65,11 @@ type Service struct {
 	HealthCheck    Health          `yaml:"health_check"`
 	PassHostHeader *bool           `yaml:"pass_host_header"`
 	CircuitBreaker *CircuitBreaker `yaml:"circuit_breaker,omitempty"`
+	Retry          *RetryConfig    `yaml:"retry,omitempty"`
+}
+
+type RetryConfig struct {
+	MaxRetries int `yaml:"max_retries"`
 }
 
 type CircuitBreaker struct {
@@ -841,7 +846,16 @@ func (p *proxyServer) directorFor(s *Service) func(*http.Request) {
 		passHost = *s.PassHostHeader
 	}
 
+	// リトライが有効かどうかをチェック
+	hasRetry := s.Retry != nil && s.Retry.MaxRetries > 0
+
 	return func(r *http.Request) {
+		// リトライ機能が有効な場合、Director は何もしない
+		// （retryRoundTripperが全てのロジックを処理する）
+		if hasRetry {
+			return
+		}
+
 		lb := p.lbs[s.Name]
 		b := lb.nextAlive()
 
@@ -888,6 +902,118 @@ func protoFromTLS(r *http.Request) string {
 	return "http"
 }
 
+// カスタムRoundTripperでリトライ機能を実装
+type retryRoundTripper struct {
+	transport      http.RoundTripper
+	lb             *lb
+	maxRetries     int
+	passHostHeader bool
+}
+
+func (rt *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
+	var lastErr error
+	var lastResp *http.Response
+	usedBackends := make(map[string]bool) // 既に試したbackendを記録
+
+	for attempt := 0; attempt <= rt.maxRetries; attempt++ {
+		// 新しいbackendを選択
+		var selectedBackend *backend
+		for retryCount := 0; retryCount < len(rt.lb.backends)*2; retryCount++ {
+			b := rt.lb.nextAlive()
+			if b == nil {
+				break
+			}
+			backendKey := b.target.String()
+			if !usedBackends[backendKey] {
+				selectedBackend = b
+				usedBackends[backendKey] = true
+				break
+			}
+		}
+
+		if selectedBackend == nil {
+			// 全てのbackendを試したか、利用可能なbackendがない
+			if lastErr != nil {
+				return nil, lastErr
+			}
+			if lastResp != nil {
+				return lastResp, nil
+			}
+			return nil, fmt.Errorf("no healthy backends available")
+		}
+
+		// リクエストURLを選択されたbackendに設定
+		reqCopy := req.Clone(req.Context())
+		reqCopy.URL.Scheme = selectedBackend.target.Scheme
+		reqCopy.URL.Host = selectedBackend.target.Host
+
+		// Host headerの処理
+		if !rt.passHostHeader {
+			reqCopy.Host = selectedBackend.target.Host
+			reqCopy.Header.Set("Host", selectedBackend.target.Host)
+		}
+
+		// X-Forwardedヘッダーの設定
+		reqCopy.Header.Set("X-Forwarded-Proto", protoFromTLS(reqCopy))
+		reqCopy.Header.Set("X-Forwarded-Host", reqCopy.Host)
+		reqCopy.Header.Add("X-Forwarded-For", clientIP(reqCopy))
+
+		// contextに選択されたbackendを保存
+		ctx := context.WithValue(reqCopy.Context(), selectedBackendKey, selectedBackend)
+		ctx = context.WithValue(ctx, loadBalancerKey, rt.lb)
+		reqCopy = reqCopy.WithContext(ctx)
+
+		log.Printf("Attempt %d: Trying backend %s for %s", attempt+1, selectedBackend.target.String(), req.URL.Path)
+
+		resp, err := rt.transport.RoundTrip(reqCopy)
+
+		if err != nil {
+			log.Printf("Backend %s failed with error: %v", selectedBackend.target.String(), err)
+			rt.lb.recordFailure(selectedBackend)
+			lastErr = err
+			continue
+		}
+
+		// レスポンスのステータスコードをチェック
+		if resp.StatusCode >= 500 && resp.StatusCode < 600 {
+			log.Printf("Backend %s returned 5xx error: %d", selectedBackend.target.String(), resp.StatusCode)
+			rt.lb.recordFailure(selectedBackend)
+
+			// レスポンスボディを読み取って閉じる（リトライのため）
+			if resp.Body != nil {
+				io.Copy(io.Discard, resp.Body)
+				resp.Body.Close()
+			}
+
+			lastResp = resp
+			lastErr = fmt.Errorf("backend returned %d", resp.StatusCode)
+
+			// 最後の試行でない場合は続行
+			if attempt < rt.maxRetries {
+				continue
+			}
+		}
+
+		// 成功または4xxエラーの場合
+		if resp.StatusCode < 500 {
+			rt.lb.recordSuccess(selectedBackend)
+		}
+
+		log.Printf("Backend %s succeeded with status: %d", selectedBackend.target.String(), resp.StatusCode)
+		return resp, nil
+	}
+
+	// 全ての試行が失敗した場合
+	if lastResp != nil {
+		return lastResp, nil
+	}
+	if lastErr != nil {
+		return nil, lastErr
+	}
+
+	return nil, fmt.Errorf("all retry attempts failed")
+}
+
 func (p *proxyServer) transport() *http.Transport {
 	return &http.Transport{
 		Proxy:                 http.ProxyFromEnvironment,
@@ -901,9 +1027,35 @@ func (p *proxyServer) transport() *http.Transport {
 }
 
 func (p *proxyServer) makeProxy(s *Service) *httputil.ReverseProxy {
+	// リトライ設定を取得
+	maxRetries := 0 // デフォルトはリトライなし
+	if s.Retry != nil && s.Retry.MaxRetries > 0 {
+		maxRetries = s.Retry.MaxRetries
+	}
+
+	// PassHostHeader設定を取得
+	passHost := true
+	if s.PassHostHeader != nil {
+		passHost = *s.PassHostHeader
+	}
+
+	loadBalancer := p.lbs[s.Name]
+
+	// カスタムトランスポートを作成（リトライ機能付き）
+	var transport http.RoundTripper = p.transport()
+	if maxRetries > 0 {
+		transport = &retryRoundTripper{
+			transport:      p.transport(),
+			lb:             loadBalancer,
+			maxRetries:     maxRetries,
+			passHostHeader: passHost,
+		}
+		log.Printf("Service %s: Retry enabled with max_retries=%d", s.Name, maxRetries)
+	}
+
 	rp := &httputil.ReverseProxy{
 		Director:  p.directorFor(s),
-		Transport: p.transport(),
+		Transport: transport,
 		ModifyResponse: func(res *http.Response) error {
 			// プロトコルバージョンを動的に判定してViaヘッダーを設定
 			protoVersion := "1.1"
@@ -913,37 +1065,38 @@ func (p *proxyServer) makeProxy(s *Service) *httputil.ReverseProxy {
 			viaValue := fmt.Sprintf("%s SparrowProxy/0.0.1", protoVersion)
 			res.Header.Set("Via", viaValue)
 
-			// 成功・失敗の統計更新と Circuit Breaker の状態更新
+			// 成功・失敗の統計更新（リトライ機能ではCircuit Breakerの記録は既に行われている）
 			if res.StatusCode >= 200 && res.StatusCode < 400 {
 				p.successRequests.Add(1)
-				// Backend の成功を記録
-				if b, ok := res.Request.Context().Value(selectedBackendKey).(*backend); ok {
-					if lb, ok := res.Request.Context().Value(loadBalancerKey).(*lb); ok {
-						lb.recordSuccess(b)
-					}
-				}
-			} else if res.StatusCode >= 500 {
-				// 5xx エラーはbackend側の問題として扱う
-				p.failRequests.Add(1)
-				if b, ok := res.Request.Context().Value(selectedBackendKey).(*backend); ok {
-					if lb, ok := res.Request.Context().Value(loadBalancerKey).(*lb); ok {
-						lb.recordFailure(b)
-					}
-				}
 			} else {
-				// 4xx エラーはクライアント側の問題として扱い、backendの統計には影響しない
 				p.failRequests.Add(1)
 			}
+
+			// リトライが無効な場合のみCircuit Breakerの記録を行う
+			if maxRetries == 0 {
+				if b, ok := res.Request.Context().Value(selectedBackendKey).(*backend); ok {
+					if lbCtx, ok := res.Request.Context().Value(loadBalancerKey).(*lb); ok {
+						if res.StatusCode >= 200 && res.StatusCode < 400 {
+							lbCtx.recordSuccess(b)
+						} else if res.StatusCode >= 500 {
+							lbCtx.recordFailure(b)
+						}
+					}
+				}
+			}
+
 			return nil
 		},
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			p.failRequests.Add(1)
 			log.Printf("proxy error: %v", err)
 
-			// Backend の失敗を記録
-			if b, ok := r.Context().Value(selectedBackendKey).(*backend); ok {
-				if lb, ok := r.Context().Value(loadBalancerKey).(*lb); ok {
-					lb.recordFailure(b)
+			// リトライが無効な場合のみCircuit Breakerの記録を行う
+			if maxRetries == 0 {
+				if b, ok := r.Context().Value(selectedBackendKey).(*backend); ok {
+					if lbCtx, ok := r.Context().Value(loadBalancerKey).(*lb); ok {
+						lbCtx.recordFailure(b)
+					}
 				}
 			}
 

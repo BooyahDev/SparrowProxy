@@ -87,6 +87,8 @@ services:
   circuit_breaker:
     max_failures: 3
     recovery_time: "10s"
+  retry:
+    max_retries: 2
 
 # Redirect rules
 redirects:
