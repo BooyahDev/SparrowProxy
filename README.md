@@ -51,18 +51,14 @@ SparrowProxy can automatically synchronize configuration and certificates from a
 - Store `config.yaml` and `certs/` folder in a separate private repository
 - Automatically pull changes every minute (configurable)
 - Apply configuration changes without manual intervention
-- Maintain security by using SSH key authentication
+- Maintain security by using GitHub Personal Access Token authentication
 
 ### Setup Git Sync
 
-1. **Prepare SSH Keys**: Ensure you have SSH keys set up for accessing your private repository:
-   ```bash
-   # Generate SSH key if you don't have one
-   ssh-keygen -t ed25519 -C "your_email@example.com"
-   
-   # Add the public key to your GitHub account
-   cat ~/.ssh/id_ed25519.pub
-   ```
+1. **Create GitHub Personal Access Token**: 
+   - Go to GitHub Settings > Developer settings > Personal access tokens > Tokens (classic)
+   - Generate a new token with `repo` scope for private repository access
+   - Copy and securely store the token (e.g., `ghp_xxxxxxxxxxxxxxxxxxxx`)
 
 2. **Create Configuration Repository**: Create a private repository with the following structure:
    ```
@@ -75,14 +71,15 @@ SparrowProxy can automatically synchronize configuration and certificates from a
 
 3. **Run with Git Sync**:
    ```bash
+   export GITHUB_TOKEN="ghp_your_personal_access_token_here"
    ./sparrowproxy \
-     -config-repo git@github.com:BooyahDev/SparrowProxyConfig.git \
+     -config-repo https://github.com/BooyahDev/SparrowProxyConfig.git \
      -sync-interval 1m
    ```
 
 ### Configuration Options
 
-- `-config-repo`: Git repository URL (SSH format recommended for private repos)
+- `-config-repo`: Git repository URL (HTTPS format for Personal Access Token authentication)
 - `-config-repo-path`: Local directory to clone the repository (default: `./config-repo`)
 - `-sync-interval`: How often to check for repository changes (default: `1m`)
 
@@ -91,8 +88,9 @@ SparrowProxy can automatically synchronize configuration and certificates from a
 You can also use environment variables:
 
 ```bash
-export CONFIG_REPO_URL="git@github.com:BooyahDev/SparrowProxyConfig.git"
+export CONFIG_REPO_URL="https://github.com/BooyahDev/SparrowProxyConfig.git"
 export CONFIG_REPO_PATH="./config-repo"
+export GITHUB_TOKEN="ghp_your_personal_access_token_here"
 ./sparrowproxy
 ```
 
@@ -131,18 +129,15 @@ SparrowProxy supports Kubernetes deployment with minimal required manifests.
 
 ### Prerequisites
 
-1. **SSH Keys**: Set up SSH keys for accessing the private configuration repository
+1. **GitHub Personal Access Token**: Create a Personal Access Token with `repo` scope for accessing the private configuration repository
 2. **kubectl**: Kubernetes command-line tool installed and configured
 
 ### Quick Deploy
 
 1. **Update Secrets**: Edit `k8s-secret.yaml` with your actual values:
    ```bash
-   # SSH private key (base64 encoded)
-   echo -n "$(cat ~/.ssh/id_ed25519)" | base64
-   
-   # Known hosts for GitHub (base64 encoded)
-   echo -n "$(ssh-keyscan github.com 2>/dev/null)" | base64
+   # GitHub Personal Access Token (base64 encoded)
+   echo -n "ghp_your_personal_access_token_here" | base64
    ```
 
 2. **Deploy to Kubernetes**:
@@ -161,7 +156,7 @@ SparrowProxy supports Kubernetes deployment with minimal required manifests.
 
 ### Kubernetes Manifests
 
-- `k8s-secret.yaml`: Contains SSH keys for Git repository access
+- `k8s-secret.yaml`: Contains GitHub Personal Access Token for Git repository access
 - `k8s-deployment.yaml`: Deployment configuration with health checks
 - `k8s-service.yaml`: LoadBalancer service for HTTP/HTTPS traffic
 
@@ -178,7 +173,7 @@ The automated build and push workflow does not require any additional repository
 
 ## Security Notes
 
-- SSH key authentication is used for private repository access
+- GitHub Personal Access Token authentication is used for private repository access
 - Certificate files are automatically resolved to the correct paths
 - File watching monitors both local and repository-synced configurations
 - Changes are applied with debouncing to prevent rapid reloads

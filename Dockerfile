@@ -22,8 +22,8 @@ RUN CGO_ENABLED=0 GOOS=linux go build -a -installsuffix cgo -o sparrowproxy main
 # Final stage
 FROM alpine:latest
 
-# Install ca-certificates, wget for healthcheck, git for repository sync, and openssh for SSH key support
-RUN apk --no-cache add ca-certificates wget git openssh-client
+# Install ca-certificates, wget for healthcheck, and git for repository sync
+RUN apk --no-cache add ca-certificates wget git
 
 # Create app directory
 WORKDIR /app

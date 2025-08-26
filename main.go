@@ -23,8 +23,7 @@ import (
 
 	"github.com/fsnotify/fsnotify"
 	"github.com/go-git/go-git/v5"
-	"github.com/go-git/go-git/v5/plumbing/transport/ssh"
-	cryptossh "golang.org/x/crypto/ssh"
+	githttp "github.com/go-git/go-git/v5/plumbing/transport/http"
 	"gopkg.in/yaml.v3"
 )
 
@@ -150,36 +149,29 @@ func newConfigSyncer(repoURL, repoPath string) *configSyncer {
 	}
 }
 
-func (cs *configSyncer) setupSSHAuth() (*ssh.PublicKeys, error) {
-	sshPath := filepath.Join(os.Getenv("HOME"), ".ssh")
-	keyFiles := []string{
-		filepath.Join(sshPath, "id_rsa"),
-		filepath.Join(sshPath, "id_ed25519"),
-		filepath.Join(sshPath, "id_ecdsa"),
+func (cs *configSyncer) setupHTTPAuth() (*githttp.BasicAuth, error) {
+	token := os.Getenv("GITHUB_TOKEN")
+	if token == "" {
+		return nil, fmt.Errorf("GITHUB_TOKEN environment variable is not set")
 	}
-	
-	for _, keyFile := range keyFiles {
-		if _, err := os.Stat(keyFile); err == nil {
-			publicKeys, err := ssh.NewPublicKeysFromFile("git", keyFile, "")
-			if err != nil {
-				log.Printf("Failed to load SSH key %s: %v", keyFile, err)
-				continue
-			}
-			// 開発環境での利便性のため、ホスト鍵検証を無効化
-			publicKeys.HostKeyCallback = cryptossh.InsecureIgnoreHostKey()
-			return publicKeys, nil
-		}
+
+	// GitHub Personal Access Tokenを使用したHTTPS認証
+	auth := &githttp.BasicAuth{
+		Username: "git", // GitHubの場合、usernameは任意の値でよい
+		Password: token,
 	}
-	return nil, fmt.Errorf("no SSH keys found in %s", sshPath)
+
+	log.Printf("Using HTTPS authentication with Personal Access Token")
+	return auth, nil
 }
 
 func (cs *configSyncer) syncRepo() error {
 	cs.mu.Lock()
 	defer cs.mu.Unlock()
 
-	auth, err := cs.setupSSHAuth()
+	auth, err := cs.setupHTTPAuth()
 	if err != nil {
-		return fmt.Errorf("SSH auth setup failed: %w", err)
+		return fmt.Errorf("HTTP auth setup failed: %w", err)
 	}
 
 	// Check if repository already exists

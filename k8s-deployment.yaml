@@ -32,14 +32,15 @@ spec:
           protocol: TCP
         env:
         - name: CONFIG_REPO_URL
-          value: "git@github.com:BooyahDev/SparrowProxyConfig.git"
+          value: "https://github.com/BooyahDev/SparrowProxyConfig.git"
         - name: CONFIG_REPO_PATH
           value: "/app/config-repo"
+        - name: GITHUB_TOKEN
+          valueFrom:
+            secretKeyRef:
+              name: sparrowproxy-config
+              key: github-token
         volumeMounts:
-        - name: ssh-key
-          mountPath: /root/.ssh/id_ed25519
-          subPath: ssh-private-key
-          readOnly: true
         - name: config-repo-volume
           mountPath: /app/config-repo
         # リソース制限（開発環境用）
@@ -68,14 +69,10 @@ spec:
           timeoutSeconds: 3
           failureThreshold: 3
       volumes:
-      - name: ssh-key
-        secret:
-          secretName: sparrowproxy-config
-          defaultMode: 0600
       - name: config-repo-volume
         emptyDir: {}
       # セキュリティ設定
       securityContext:
-        runAsNonRoot: false # SSH設定のためrootで実行
-        runAsUser: 0
+        runAsNonRoot: true # Personal Access Tokenを使用するため、rootは不要
+        runAsUser: 1000
       restartPolicy: Always

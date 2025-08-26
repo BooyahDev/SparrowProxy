@@ -17,6 +17,7 @@ k8s-*.yaml
 .github/
 
 # Development files
+config.yaml
 certs/
 
 # IDE
