@@ -40,10 +40,6 @@ spec:
           mountPath: /root/.ssh/id_ed25519
           subPath: ssh-private-key
           readOnly: true
-        - name: ssh-config
-          mountPath: /root/.ssh/known_hosts
-          subPath: known_hosts
-          readOnly: true
         - name: config-repo-volume
           mountPath: /app/config-repo
         # リソース制限（開発環境用）
@@ -76,10 +72,6 @@ spec:
         secret:
           secretName: sparrowproxy-config
           defaultMode: 600
-      - name: ssh-config
-        secret:
-          secretName: sparrowproxy-ssh-config
-          defaultMode: 644
       - name: config-repo-volume
         emptyDir: {}
       # セキュリティ設定

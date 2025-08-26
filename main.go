@@ -24,6 +24,7 @@ import (
 	"github.com/fsnotify/fsnotify"
 	"github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing/transport/ssh"
+	cryptossh "golang.org/x/crypto/ssh"
 	"gopkg.in/yaml.v3"
 )
 
@@ -125,7 +126,6 @@ func (l *lb) nextAlive() *backend {
 type proxyServer struct {
 	mu              sync.RWMutex
 	cfg             *Config
-	services        []*Service
 	lbs             map[string]*lb
 	certMap         map[string]*tls.Certificate
 	defaultCert     *tls.Certificate
@@ -138,10 +138,9 @@ type proxyServer struct {
 }
 
 type configSyncer struct {
-	repoURL    string
-	repoPath   string
-	sshKeyPath string
-	mu         sync.Mutex
+	repoURL  string
+	repoPath string
+	mu       sync.Mutex
 }
 
 func newConfigSyncer(repoURL, repoPath string) *configSyncer {
@@ -158,7 +157,7 @@ func (cs *configSyncer) setupSSHAuth() (*ssh.PublicKeys, error) {
 		filepath.Join(sshPath, "id_ed25519"),
 		filepath.Join(sshPath, "id_ecdsa"),
 	}
-
+	
 	for _, keyFile := range keyFiles {
 		if _, err := os.Stat(keyFile); err == nil {
 			publicKeys, err := ssh.NewPublicKeysFromFile("git", keyFile, "")
@@ -166,6 +165,8 @@ func (cs *configSyncer) setupSSHAuth() (*ssh.PublicKeys, error) {
 				log.Printf("Failed to load SSH key %s: %v", keyFile, err)
 				continue
 			}
+			// 開発環境での利便性のため、ホスト鍵検証を無効化
+			publicKeys.HostKeyCallback = cryptossh.InsecureIgnoreHostKey()
 			return publicKeys, nil
 		}
 	}
