@@ -28,6 +28,13 @@ import (
 	"gopkg.in/yaml.v3"
 )
 
+type contextKey string
+
+const (
+	selectedBackendKey contextKey = "selectedBackend"
+	loadBalancerKey    contextKey = "loadBalancer"
+)
+
 type Config struct {
 	TLS       []TLSCert      `yaml:"tls"`
 	Services  []Service      `yaml:"services"`
@@ -51,12 +58,18 @@ type TLSCert struct {
 }
 
 type Service struct {
-	Name           string     `yaml:"name"`
-	Hosts          []string   `yaml:"hosts"`
-	Routes         []string   `yaml:"routes"`
-	Upstreams      []Upstream `yaml:"upstreams"`
-	HealthCheck    Health     `yaml:"health_check"`
-	PassHostHeader *bool      `yaml:"pass_host_header"`
+	Name           string          `yaml:"name"`
+	Hosts          []string        `yaml:"hosts"`
+	Routes         []string        `yaml:"routes"`
+	Upstreams      []Upstream      `yaml:"upstreams"`
+	HealthCheck    Health          `yaml:"health_check"`
+	PassHostHeader *bool           `yaml:"pass_host_header"`
+	CircuitBreaker *CircuitBreaker `yaml:"circuit_breaker,omitempty"`
+}
+
+type CircuitBreaker struct {
+	MaxFailures  uint32        `yaml:"max_failures"`
+	RecoveryTime time.Duration `yaml:"recovery_time"`
 }
 
 type Upstream struct {
@@ -84,20 +97,39 @@ type StatsResponse struct {
 }
 
 type backend struct {
-	target *url.URL
-	alive  atomic.Bool
+	target           *url.URL
+	alive            atomic.Bool
+	consecutiveFails atomic.Uint32
+	lastFailTime     atomic.Int64
+	recoveryTime     atomic.Int64 // time when backend can be retried
 }
 
 type lb struct {
-	name     string
-	backends []*backend
-	idx      atomic.Uint32
+	name           string
+	backends       []*backend
+	idx            atomic.Uint32
+	maxFailures    uint32
+	recoveryTimeMs int64
 }
 
-func newLB(name string, ups []Upstream) (*lb, error) {
+func newLB(name string, ups []Upstream, circuitBreaker *CircuitBreaker) (*lb, error) {
 	if len(ups) == 0 {
 		return nil, errors.New("no upstreams")
 	}
+
+	// Circuit Breaker のデフォルト値
+	maxFailures := uint32(3)
+	recoveryTimeMs := int64(10 * 1000) // 10秒
+
+	if circuitBreaker != nil {
+		if circuitBreaker.MaxFailures > 0 {
+			maxFailures = circuitBreaker.MaxFailures
+		}
+		if circuitBreaker.RecoveryTime > 0 {
+			recoveryTimeMs = circuitBreaker.RecoveryTime.Milliseconds()
+		}
+	}
+
 	bks := make([]*backend, 0, len(ups))
 	for _, u := range ups {
 		pu, err := url.Parse(u.URL)
@@ -106,21 +138,98 @@ func newLB(name string, ups []Upstream) (*lb, error) {
 		}
 		b := &backend{target: pu}
 		b.alive.Store(true)
+		b.consecutiveFails.Store(0)
+		b.lastFailTime.Store(0)
+		b.recoveryTime.Store(0)
 		bks = append(bks, b)
 	}
-	return &lb{name: name, backends: bks}, nil
+
+	log.Printf("Created load balancer for %s with circuit breaker: max_failures=%d, recovery_time=%dms",
+		name, maxFailures, recoveryTimeMs)
+
+	return &lb{
+		name:           name,
+		backends:       bks,
+		maxFailures:    maxFailures,
+		recoveryTimeMs: recoveryTimeMs,
+	}, nil
 }
 
 func (l *lb) nextAlive() *backend {
 	n := uint32(len(l.backends))
-	for i := uint32(0); i < n; i++ {
+	if n == 0 {
+		return nil
+	}
+
+	currentTime := time.Now().UnixMilli()
+	var fallbackBackend *backend
+
+	// 最大2周回してでも健全なbackendを探す
+	for attempts := uint32(0); attempts < n*2; attempts++ {
 		idx := l.idx.Add(1)
 		b := l.backends[idx%n]
+
+		// ヘルスチェックで生きていることが確認されている
 		if b.alive.Load() {
+			// Circuit Breakerが開いているかチェック
+			if l.isCircuitBreakerOpen(b, currentTime) {
+				// Circuit Breakerが開いているが、recovery timeを過ぎていればリトライを許可
+				if currentTime >= b.recoveryTime.Load() {
+					log.Printf("Backend %s: Circuit breaker half-open, allowing retry", b.target.String())
+					return b
+				}
+				// まだrecovery timeに達していない場合は、fallbackとして記憶しておく
+				if fallbackBackend == nil {
+					fallbackBackend = b
+				}
+				continue
+			}
 			return b
 		}
+
+		// ヘルスチェックでダウンしているが、fallbackとして記憶
+		if fallbackBackend == nil {
+			fallbackBackend = b
+		}
 	}
+
+	// 健全なbackendが見つからない場合
+	if fallbackBackend != nil {
+		log.Printf("No healthy backends available for service %s, using fallback: %s", l.name, fallbackBackend.target.String())
+		return fallbackBackend
+	}
+
+	// 最後の手段として最初のbackendを返す
+	log.Printf("All backends down for service %s, using first backend as last resort", l.name)
 	return l.backends[0]
+}
+
+func (l *lb) isCircuitBreakerOpen(b *backend, currentTime int64) bool {
+	consecutiveFails := b.consecutiveFails.Load()
+	return consecutiveFails >= l.maxFailures
+}
+
+func (l *lb) recordSuccess(b *backend) {
+	if b.consecutiveFails.Load() > 0 {
+		log.Printf("Backend %s recovered, resetting failure count", b.target.String())
+		b.consecutiveFails.Store(0)
+		b.recoveryTime.Store(0)
+	}
+}
+
+func (l *lb) recordFailure(b *backend) {
+	currentTime := time.Now().UnixMilli()
+	failures := b.consecutiveFails.Add(1)
+	b.lastFailTime.Store(currentTime)
+
+	if failures >= l.maxFailures {
+		recoveryTime := currentTime + l.recoveryTimeMs
+		b.recoveryTime.Store(recoveryTime)
+		log.Printf("Backend %s: Circuit breaker opened after %d failures, recovery at %v",
+			b.target.String(), failures, time.UnixMilli(recoveryTime))
+	} else {
+		log.Printf("Backend %s: Recorded failure %d/%d", b.target.String(), failures, l.maxFailures)
+	}
 }
 
 type proxyServer struct {
@@ -634,7 +743,7 @@ func (p *proxyServer) applyConfig(c *Config) error {
 	p.lbs = make(map[string]*lb)
 	for i := range c.Services {
 		s := &c.Services[i]
-		l, err := newLB(s.Name, s.Upstreams)
+		l, err := newLB(s.Name, s.Upstreams, s.CircuitBreaker)
 		if err != nil {
 			return err
 		}
@@ -736,6 +845,11 @@ func (p *proxyServer) directorFor(s *Service) func(*http.Request) {
 		lb := p.lbs[s.Name]
 		b := lb.nextAlive()
 
+		if b == nil {
+			log.Printf("No backends available for service %s", s.Name)
+			return
+		}
+
 		r.URL.Scheme = b.target.Scheme
 		r.URL.Host = b.target.Host
 
@@ -748,6 +862,11 @@ func (p *proxyServer) directorFor(s *Service) func(*http.Request) {
 		r.Header.Set("X-Forwarded-Proto", protoFromTLS(r))
 		r.Header.Set("X-Forwarded-Host", r.Host)
 		r.Header.Add("X-Forwarded-For", clientIP(r))
+
+		// 選択されたbackendをcontextに保存（エラーハンドラーで使用）
+		ctx := context.WithValue(r.Context(), selectedBackendKey, b)
+		ctx = context.WithValue(ctx, loadBalancerKey, lb)
+		*r = *r.WithContext(ctx)
 	}
 }
 
@@ -794,10 +913,25 @@ func (p *proxyServer) makeProxy(s *Service) *httputil.ReverseProxy {
 			viaValue := fmt.Sprintf("%s SparrowProxy/0.0.1", protoVersion)
 			res.Header.Set("Via", viaValue)
 
-			// 成功・失敗の統計更新
+			// 成功・失敗の統計更新と Circuit Breaker の状態更新
 			if res.StatusCode >= 200 && res.StatusCode < 400 {
 				p.successRequests.Add(1)
+				// Backend の成功を記録
+				if b, ok := res.Request.Context().Value(selectedBackendKey).(*backend); ok {
+					if lb, ok := res.Request.Context().Value(loadBalancerKey).(*lb); ok {
+						lb.recordSuccess(b)
+					}
+				}
+			} else if res.StatusCode >= 500 {
+				// 5xx エラーはbackend側の問題として扱う
+				p.failRequests.Add(1)
+				if b, ok := res.Request.Context().Value(selectedBackendKey).(*backend); ok {
+					if lb, ok := res.Request.Context().Value(loadBalancerKey).(*lb); ok {
+						lb.recordFailure(b)
+					}
+				}
 			} else {
+				// 4xx エラーはクライアント側の問題として扱い、backendの統計には影響しない
 				p.failRequests.Add(1)
 			}
 			return nil
@@ -805,6 +939,14 @@ func (p *proxyServer) makeProxy(s *Service) *httputil.ReverseProxy {
 		ErrorHandler: func(w http.ResponseWriter, r *http.Request, err error) {
 			p.failRequests.Add(1)
 			log.Printf("proxy error: %v", err)
+
+			// Backend の失敗を記録
+			if b, ok := r.Context().Value(selectedBackendKey).(*backend); ok {
+				if lb, ok := r.Context().Value(loadBalancerKey).(*lb); ok {
+					lb.recordFailure(b)
+				}
+			}
+
 			http.Error(w, "Bad Gateway", http.StatusBadGateway)
 		},
 		FlushInterval: 50 * time.Millisecond,
@@ -816,7 +958,7 @@ func (p *proxyServer) startHealthChecks(ctx context.Context) {
 	p.mu.RLock()
 	cfg := p.cfg
 	p.mu.RUnlock()
-	hc := &http.Client{Timeout: 2 * time.Second}
+
 	for i := range cfg.Services {
 		s := &cfg.Services[i]
 		path := s.HealthCheck.Path
@@ -832,10 +974,10 @@ func (p *proxyServer) startHealthChecks(ctx context.Context) {
 			timeout = 1 * time.Second
 		}
 
-		clent := &http.Client{Timeout: timeout}
+		client := &http.Client{Timeout: timeout}
 		lb := p.lbs[s.Name]
 
-		go func() {
+		go func(serviceName string) {
 			t := time.NewTicker(interval)
 			defer t.Stop()
 			for {
@@ -846,25 +988,52 @@ func (p *proxyServer) startHealthChecks(ctx context.Context) {
 					for _, b := range lb.backends {
 						u := *b.target
 						u.Path = path
-						ok := checkOnce(clent, u.String())
+
+						// ヘルスチェック実行
+						ok := checkOnce(client, u.String())
+						previousState := b.alive.Load()
 						b.alive.Store(ok)
+
+						// 状態が変化した場合はログを出力
+						if ok != previousState {
+							if ok {
+								log.Printf("Backend %s for service %s is now healthy", b.target.String(), serviceName)
+								// ヘルスチェックで回復した場合は Circuit Breaker もリセット
+								lb.recordSuccess(b)
+							} else {
+								log.Printf("Backend %s for service %s is now unhealthy", b.target.String(), serviceName)
+							}
+						}
 					}
 				}
 			}
-		}()
+		}(s.Name)
 	}
-	_ = hc
 }
 
 func checkOnce(c *http.Client, url string) bool {
-	req, _ := http.NewRequest("GET", url, nil)
-	resp, err := c.Do(req)
+	req, err := http.NewRequest("GET", url, nil)
 	if err != nil {
+		log.Printf("Health check request creation failed for %s: %v", url, err)
 		return false
 	}
+
+	resp, err := c.Do(req)
+	if err != nil {
+		log.Printf("Health check failed for %s: %v", url, err)
+		return false
+	}
+	defer resp.Body.Close()
+
+	// レスポンスボディを読み取って破棄
 	io.Copy(io.Discard, resp.Body)
-	resp.Body.Close()
-	return resp.StatusCode >= 200 && resp.StatusCode < 400
+
+	healthy := resp.StatusCode >= 200 && resp.StatusCode < 400
+	if !healthy {
+		log.Printf("Health check returned unhealthy status %d for %s", resp.StatusCode, url)
+	}
+
+	return healthy
 }
 
 func (p *proxyServer) httpRedirectMux() http.Handler {

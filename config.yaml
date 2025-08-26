@@ -77,12 +77,16 @@ services:
   routes:
   - "/"
   upstreams:
-  - url: "http://backend:8080"
+  - url: "http://backend1:8080"
+  - url: "http://backend2:8080"
   health_check:
     path: "/health"
     interval: "10s"
     timeout: "5s"
   pass_host_header: true
+  circuit_breaker:
+    max_failures: 3
+    recovery_time: "10s"
 
 # Redirect rules
 redirects:
