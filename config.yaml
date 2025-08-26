@@ -1,9 +1,9 @@
 # SparrowProxy Configuration
 http:
-  addr: ":80"
+  addr: ":8080"
 
 https:
-  addr: ":443"
+  addr: ":8443"
 
 # TLS certificates
 tls:
