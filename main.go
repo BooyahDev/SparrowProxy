@@ -176,14 +176,23 @@ func (cs *configSyncer) syncRepo() error {
 
 	// Check if repository already exists
 	if _, err := os.Stat(cs.repoPath); os.IsNotExist(err) {
+		// Ensure parent directory exists
+		if err := os.MkdirAll(filepath.Dir(cs.repoPath), 0755); err != nil {
+			return fmt.Errorf("failed to create parent directory: %w", err)
+		}
+
 		// Clone repository
 		log.Printf("Cloning config repository from %s to %s", cs.repoURL, cs.repoPath)
 		_, err := git.PlainClone(cs.repoPath, false, &git.CloneOptions{
-			URL:      cs.repoURL,
-			Auth:     auth,
-			Progress: os.Stdout,
+			URL:             cs.repoURL,
+			Auth:            auth,
+			Progress:        os.Stdout,
+			InsecureSkipTLS: false,
+			CABundle:        []byte{},
 		})
 		if err != nil {
+			// More detailed error logging
+			log.Printf("Clone failed - URL: %s, Path: %s, Error: %v", cs.repoURL, cs.repoPath, err)
 			return fmt.Errorf("failed to clone repository: %w", err)
 		}
 		log.Printf("Successfully cloned config repository")

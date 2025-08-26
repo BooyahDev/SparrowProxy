@@ -1,0 +1,44 @@
+apiVersion: v1
+kind: Pod
+metadata:
+  name: debug-repo-access
+  namespace: default
+spec:
+  containers:
+  - name: debug
+    image: alpine/git:latest
+    command: [ "/bin/sh" ]
+    args:
+    - -c
+    - |
+      echo "Testing repository access..."
+      echo "Repository URL: $CONFIG_REPO_URL"
+      echo "GitHub Token (first 10 chars): ${GITHUB_TOKEN:0:10}..."
+
+      # Git configuration
+      git config --global user.email "test@example.com"
+      git config --global user.name "Debug Test"
+      git config --global init.defaultBranch main
+
+      # Test repository access
+      echo "Attempting to clone repository..."
+      git clone https://git:$GITHUB_TOKEN@github.com/BooyahDev/SparrowProxyConfig.git /tmp/test-repo
+
+      if [ $? -eq 0 ]; then
+        echo "SUCCESS: Repository cloned successfully"
+        ls -la /tmp/test-repo/
+      else
+        echo "FAILED: Repository clone failed"
+      fi
+
+      # Keep container running for inspection
+      sleep 3600
+    env:
+    - name: CONFIG_REPO_URL
+      value: "https://github.com/BooyahDev/SparrowProxyConfig.git"
+    - name: GITHUB_TOKEN
+      valueFrom:
+        secretKeyRef:
+          name: sparrowproxy-config
+          key: github-token
+  restartPolicy: Never

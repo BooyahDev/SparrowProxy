@@ -15,6 +15,32 @@ spec:
       labels:
         app: sparrowproxy
     spec:
+      initContainers:
+      - name: git-config-init
+        image: alpine/git:latest
+        command: [ "/bin/sh" ]
+        args:
+        - -c
+        - |
+          mkdir -p /tmp/.ssh /app/config-repo
+          git config --global user.email "sparrowproxy@booyah.dev"
+          git config --global user.name "SparrowProxy"
+          git config --global init.defaultBranch main
+          git config --global --add safe.directory /app/config-repo
+          chmod 755 /tmp /app/config-repo
+        env:
+        - name: HOME
+          value: "/tmp"
+        - name: GIT_CONFIG_GLOBAL
+          value: "/tmp/.gitconfig"
+        volumeMounts:
+        - name: config-repo-volume
+          mountPath: /app/config-repo
+        - name: git-config-volume
+          mountPath: /tmp
+        securityContext:
+          runAsUser: 1000
+          runAsGroup: 1000
       containers:
       - name: sparrowproxy
         # GitHub Actionsでビルド・プッシュされるイメージ
@@ -40,9 +66,15 @@ spec:
             secretKeyRef:
               name: sparrowproxy-config
               key: github-token
+        - name: GIT_CONFIG_GLOBAL
+          value: "/tmp/.gitconfig"
+        - name: HOME
+          value: "/tmp"
         volumeMounts:
         - name: config-repo-volume
           mountPath: /app/config-repo
+        - name: git-config-volume
+          mountPath: /tmp
         # リソース制限（開発環境用）
         resources:
           requests:
@@ -75,5 +107,7 @@ spec:
           failureThreshold: 3
       volumes:
       - name: config-repo-volume
+        emptyDir: {}
+      - name: git-config-volume
         emptyDir: {}
       restartPolicy: Always
