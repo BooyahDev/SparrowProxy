@@ -867,6 +867,25 @@ func (p *proxyServer) directorFor(s *Service) func(*http.Request) {
 		r.URL.Scheme = b.target.Scheme
 		r.URL.Host = b.target.Host
 
+		// アップストリームのパスとリクエストパスを適切に結合
+		if b.target.Path != "" && b.target.Path != "/" {
+			// アップストリームにパスが設定されている場合
+			targetPath := strings.TrimSuffix(b.target.Path, "/")
+			requestPath := r.URL.Path
+			if !strings.HasPrefix(requestPath, "/") {
+				requestPath = "/" + requestPath
+			}
+			r.URL.Path = targetPath + requestPath
+		}
+		// RawQueryとFragmentも引き継ぐ
+		if b.target.RawQuery != "" {
+			if r.URL.RawQuery != "" {
+				r.URL.RawQuery = b.target.RawQuery + "&" + r.URL.RawQuery
+			} else {
+				r.URL.RawQuery = b.target.RawQuery
+			}
+		}
+
 		if !passHost {
 			r.Host = b.target.Host
 			r.Header.Set("Host", b.target.Host)
@@ -946,6 +965,25 @@ func (rt *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 		reqCopy := req.Clone(req.Context())
 		reqCopy.URL.Scheme = selectedBackend.target.Scheme
 		reqCopy.URL.Host = selectedBackend.target.Host
+
+		// アップストリームのパスとリクエストパスを適切に結合
+		if selectedBackend.target.Path != "" && selectedBackend.target.Path != "/" {
+			// アップストリームにパスが設定されている場合
+			targetPath := strings.TrimSuffix(selectedBackend.target.Path, "/")
+			requestPath := reqCopy.URL.Path
+			if !strings.HasPrefix(requestPath, "/") {
+				requestPath = "/" + requestPath
+			}
+			reqCopy.URL.Path = targetPath + requestPath
+		}
+		// RawQueryとFragmentも引き継ぐ
+		if selectedBackend.target.RawQuery != "" {
+			if reqCopy.URL.RawQuery != "" {
+				reqCopy.URL.RawQuery = selectedBackend.target.RawQuery + "&" + reqCopy.URL.RawQuery
+			} else {
+				reqCopy.URL.RawQuery = selectedBackend.target.RawQuery
+			}
+		}
 
 		// Host headerの処理
 		if !rt.passHostHeader {
