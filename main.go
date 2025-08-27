@@ -882,12 +882,14 @@ func (p *proxyServer) directorFor(s *Service) func(*http.Request) {
 
 		// デバッグログ追加
 		log.Printf("Director: Original URL: %s %s", r.Method, r.URL.String())
+		log.Printf("Director: Original Host: %s", r.Host)
 		log.Printf("Director: Backend target: %s", b.target.String())
 
 		r.URL.Scheme = b.target.Scheme
 		r.URL.Host = b.target.Host
 
 		// アップストリームのパスとリクエストパスを適切に結合
+		originalRequestPath := r.URL.Path
 		if b.target.Path != "" && b.target.Path != "/" {
 			// アップストリームにパスが設定されている場合
 			targetPath := strings.TrimSuffix(b.target.Path, "/")
@@ -895,7 +897,9 @@ func (p *proxyServer) directorFor(s *Service) func(*http.Request) {
 			if !strings.HasPrefix(requestPath, "/") {
 				requestPath = "/" + requestPath
 			}
-			r.URL.Path = targetPath + requestPath
+			// 元のリクエストパスの末尾スラッシュを保持
+			combinedPath := targetPath + requestPath
+			r.URL.Path = combinedPath
 		}
 		// RawQueryとFragmentも引き継ぐ
 		if b.target.RawQuery != "" {
@@ -908,7 +912,9 @@ func (p *proxyServer) directorFor(s *Service) func(*http.Request) {
 
 		// デバッグログ追加
 		log.Printf("Director: Final URL: %s", r.URL.String())
+		log.Printf("Director: Path change: %s -> %s", originalRequestPath, r.URL.Path)
 
+		originalHost := r.Host
 		if !passHost {
 			r.Host = b.target.Host
 			r.Header.Set("Host", b.target.Host)
@@ -916,8 +922,13 @@ func (p *proxyServer) directorFor(s *Service) func(*http.Request) {
 
 		// X-Forwarded
 		r.Header.Set("X-Forwarded-Proto", protoFromTLS(r))
-		r.Header.Set("X-Forwarded-Host", r.Host)
+		r.Header.Set("X-Forwarded-Host", originalHost) // 元のHostを使用
 		r.Header.Add("X-Forwarded-For", clientIP(r))
+
+		// デバッグ用：設定されたヘッダーをログに出力
+		log.Printf("Director: Host header: %s", r.Host)
+		log.Printf("Director: X-Forwarded-Host: %s", r.Header.Get("X-Forwarded-Host"))
+		log.Printf("Director: X-Forwarded-Proto: %s", r.Header.Get("X-Forwarded-Proto"))
 
 		// 選択されたbackendをcontextに保存（エラーハンドラーで使用）
 		ctx := context.WithValue(r.Context(), selectedBackendKey, b)
@@ -989,12 +1000,14 @@ func (rt *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 
 		// デバッグログ追加
 		log.Printf("RetryRoundTripper: Original URL: %s %s", reqCopy.Method, reqCopy.URL.String())
+		log.Printf("RetryRoundTripper: Original Host: %s", reqCopy.Host)
 		log.Printf("RetryRoundTripper: Backend target: %s", selectedBackend.target.String())
 
 		reqCopy.URL.Scheme = selectedBackend.target.Scheme
 		reqCopy.URL.Host = selectedBackend.target.Host
 
 		// アップストリームのパスとリクエストパスを適切に結合
+		originalRequestPath := reqCopy.URL.Path
 		if selectedBackend.target.Path != "" && selectedBackend.target.Path != "/" {
 			// アップストリームにパスが設定されている場合
 			targetPath := strings.TrimSuffix(selectedBackend.target.Path, "/")
@@ -1002,7 +1015,9 @@ func (rt *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 			if !strings.HasPrefix(requestPath, "/") {
 				requestPath = "/" + requestPath
 			}
-			reqCopy.URL.Path = targetPath + requestPath
+			// 元のリクエストパスの末尾スラッシュを保持
+			combinedPath := targetPath + requestPath
+			reqCopy.URL.Path = combinedPath
 		}
 		// RawQueryとFragmentも引き継ぐ
 		if selectedBackend.target.RawQuery != "" {
@@ -1015,8 +1030,10 @@ func (rt *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 
 		// デバッグログ追加
 		log.Printf("RetryRoundTripper: Final URL: %s", reqCopy.URL.String())
+		log.Printf("RetryRoundTripper: Path change: %s -> %s", originalRequestPath, reqCopy.URL.Path)
 
 		// Host headerの処理
+		originalHost := reqCopy.Host
 		if !rt.passHostHeader {
 			reqCopy.Host = selectedBackend.target.Host
 			reqCopy.Header.Set("Host", selectedBackend.target.Host)
@@ -1024,8 +1041,13 @@ func (rt *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 
 		// X-Forwardedヘッダーの設定
 		reqCopy.Header.Set("X-Forwarded-Proto", protoFromTLS(reqCopy))
-		reqCopy.Header.Set("X-Forwarded-Host", reqCopy.Host)
+		reqCopy.Header.Set("X-Forwarded-Host", originalHost) // 元のHostを使用
 		reqCopy.Header.Add("X-Forwarded-For", clientIP(reqCopy))
+
+		// デバッグ用：設定されたヘッダーをログに出力
+		log.Printf("RetryRoundTripper: Host header: %s", reqCopy.Host)
+		log.Printf("RetryRoundTripper: X-Forwarded-Host: %s", reqCopy.Header.Get("X-Forwarded-Host"))
+		log.Printf("RetryRoundTripper: X-Forwarded-Proto: %s", reqCopy.Header.Get("X-Forwarded-Proto"))
 
 		// contextに選択されたbackendを保存
 		ctx := context.WithValue(reqCopy.Context(), selectedBackendKey, selectedBackend)
@@ -1133,6 +1155,12 @@ func (p *proxyServer) makeProxy(s *Service) *httputil.ReverseProxy {
 			}
 			viaValue := fmt.Sprintf("%s SparrowProxy/0.0.1", protoVersion)
 			res.Header.Set("Via", viaValue)
+
+			// デバッグ用：リダイレクトレスポンスをログに出力
+			if res.StatusCode >= 300 && res.StatusCode < 400 {
+				location := res.Header.Get("Location")
+				log.Printf("REDIRECT: %d to %s for request %s %s", res.StatusCode, location, res.Request.Method, res.Request.URL.String())
+			}
 
 			// 成功・失敗の統計更新（リトライ機能ではCircuit Breakerの記録は既に行われている）
 			if res.StatusCode >= 200 && res.StatusCode < 400 {
@@ -1283,20 +1311,32 @@ func (p *proxyServer) httpsMux() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p.totalRequests.Add(1) // 総リクエスト数をカウント
 
-		// パスの正規化（二重スラッシュなどの問題を解決）
+		// リクエストの詳細をログに出力
+		log.Printf("REQUEST: %s %s %s", r.Method, r.Host, r.URL.String())
+
+		// パスの正規化を行うが、末尾のスラッシュは保持する
 		originalPath := r.URL.Path
 		normalizedPath := path.Clean(r.URL.Path)
+		
+		// path.Clean() が末尾のスラッシュを削除した場合で、元のパスが "/" で終わっていて、
+		// 正規化後が "/" 以外の場合は、末尾のスラッシュを復元する
+		if originalPath != "/" && strings.HasSuffix(originalPath, "/") && !strings.HasSuffix(normalizedPath, "/") {
+			normalizedPath += "/"
+		}
+		
 		if normalizedPath != originalPath {
 			log.Printf("Path normalized: %s -> %s", originalPath, normalizedPath)
-			r.URL.Path = normalizedPath
 		}
+		r.URL.Path = normalizedPath
 
 		s := p.matchService(r.Host, r.URL.Path)
 		if s == nil {
 			p.failRequests.Add(1) // 404の場合は失敗としてカウント
+			log.Printf("No service matched for host=%s path=%s", r.Host, r.URL.Path)
 			http.NotFound(w, r)
 			return
 		}
+		log.Printf("Matched service: %s", s.Name)
 		rp := p.makeProxy(s)
 		rp.ServeHTTP(w, r)
 	})
