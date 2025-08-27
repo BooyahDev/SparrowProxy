@@ -709,6 +709,21 @@ func loadConfig(path string) (*Config, error) {
 	return &c, nil
 }
 
+func createDefaultConfig() *Config {
+	log.Printf("Using minimal default configuration - waiting for config repository sync")
+	return &Config{
+		HTTP: Listener{
+			Addr: ":8080",
+		},
+		HTTPS: Listener{
+			Addr: ":8443",
+		},
+		TLS:       []TLSCert{},
+		Services:  []Service{},
+		Redirects: []RedirectRule{},
+	}
+}
+
 func (p *proxyServer) loadConfigFromRepo() error {
 	configPath := filepath.Join(p.configRepoPath, "config.yaml")
 
@@ -1431,16 +1446,25 @@ func main() {
 	var configRepoPath string
 	var syncInterval time.Duration
 
-	flag.StringVar(&cfgPath, "config", getenv("CONFIG_PATH", "./config.yaml"), "config file path")
+	flag.StringVar(&cfgPath, "config", getenv("CONFIG_PATH", "/app/config-repo/config.yaml"), "config file path")
 	flag.StringVar(&configRepoURL, "config-repo", getenv("CONFIG_REPO_URL", ""), "config repository URL (e.g., git@github.com:user/repo.git)")
 	flag.StringVar(&configRepoPath, "config-repo-path", getenv("CONFIG_REPO_PATH", "./config-repo"), "local path to clone config repository")
 	flag.DurationVar(&syncInterval, "sync-interval", time.Minute, "interval for syncing config repository")
 	flag.Parse()
 
-	// Load initial config from local file
-	cfg, err := loadConfig(cfgPath)
-	if err != nil {
-		log.Fatal(err)
+	// Load initial config from local file or use default config
+	var cfg *Config
+	var err error
+
+	if _, err := os.Stat(cfgPath); os.IsNotExist(err) {
+		log.Printf("Config file not found at %s, using default configuration", cfgPath)
+		cfg = createDefaultConfig()
+	} else {
+		cfg, err = loadConfig(cfgPath)
+		if err != nil {
+			log.Printf("Failed to load config from %s, using default configuration: %v", cfgPath, err)
+			cfg = createDefaultConfig()
+		}
 	}
 
 	p := &proxyServer{

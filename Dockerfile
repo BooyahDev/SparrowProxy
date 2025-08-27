@@ -31,9 +31,6 @@ WORKDIR /app
 # Copy the binary from builder stage
 COPY --from=builder /app/sparrowproxy .
 
-# Copy the default config file
-COPY config.yaml .
-
 # Create directories for config and certs
 RUN mkdir -p /app/certs /app/config-repo
 
@@ -52,7 +49,7 @@ USER sparrow
 EXPOSE 80 443 8000
 
 # Set default environment variables
-ENV CONFIG_PATH=/app/config.yaml
+ENV CONFIG_PATH=/app/config-repo/config.yaml
 ENV CONFIG_REPO_PATH=/app/config-repo
 
 # Run the application

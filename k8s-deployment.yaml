@@ -31,6 +31,8 @@ spec:
           name: health
           protocol: TCP
         env:
+        - name: CONFIG_PATH
+          value: "/app/config-repo/config.yaml"
         - name: CONFIG_REPO_URL
           value: "https://github.com/BooyahDev/SparrowProxyConfig.git"
         - name: CONFIG_REPO_PATH
