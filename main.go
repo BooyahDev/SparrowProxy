@@ -16,6 +16,7 @@ import (
 	"net/url"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -864,6 +865,10 @@ func (p *proxyServer) directorFor(s *Service) func(*http.Request) {
 			return
 		}
 
+		// デバッグログ追加
+		log.Printf("Director: Original URL: %s %s", r.Method, r.URL.String())
+		log.Printf("Director: Backend target: %s", b.target.String())
+
 		r.URL.Scheme = b.target.Scheme
 		r.URL.Host = b.target.Host
 
@@ -885,6 +890,9 @@ func (p *proxyServer) directorFor(s *Service) func(*http.Request) {
 				r.URL.RawQuery = b.target.RawQuery
 			}
 		}
+
+		// デバッグログ追加
+		log.Printf("Director: Final URL: %s", r.URL.String())
 
 		if !passHost {
 			r.Host = b.target.Host
@@ -963,6 +971,11 @@ func (rt *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 
 		// リクエストURLを選択されたbackendに設定
 		reqCopy := req.Clone(req.Context())
+
+		// デバッグログ追加
+		log.Printf("RetryRoundTripper: Original URL: %s %s", reqCopy.Method, reqCopy.URL.String())
+		log.Printf("RetryRoundTripper: Backend target: %s", selectedBackend.target.String())
+
 		reqCopy.URL.Scheme = selectedBackend.target.Scheme
 		reqCopy.URL.Host = selectedBackend.target.Host
 
@@ -984,6 +997,9 @@ func (rt *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 				reqCopy.URL.RawQuery = selectedBackend.target.RawQuery
 			}
 		}
+
+		// デバッグログ追加
+		log.Printf("RetryRoundTripper: Final URL: %s", reqCopy.URL.String())
 
 		// Host headerの処理
 		if !rt.passHostHeader {
@@ -1251,6 +1267,15 @@ func (p *proxyServer) httpRedirectMux() http.Handler {
 func (p *proxyServer) httpsMux() http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		p.totalRequests.Add(1) // 総リクエスト数をカウント
+
+		// パスの正規化（二重スラッシュなどの問題を解決）
+		originalPath := r.URL.Path
+		normalizedPath := path.Clean(r.URL.Path)
+		if normalizedPath != originalPath {
+			log.Printf("Path normalized: %s -> %s", originalPath, normalizedPath)
+			r.URL.Path = normalizedPath
+		}
+
 		s := p.matchService(r.Host, r.URL.Path)
 		if s == nil {
 			p.failRequests.Add(1) // 404の場合は失敗としてカウント
