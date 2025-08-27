@@ -18,7 +18,7 @@ spec:
       containers:
       - name: sparrowproxy
         # GitHub Actionsでビルド・プッシュされるイメージ
-        image: docker-registry.booyah.dev/sparrowproxy:latest
+        image: ghcr.io/booyahdev/sparrowproxy:latest
         imagePullPolicy: Always
         ports:
         - containerPort: 8080

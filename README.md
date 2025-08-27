@@ -162,14 +162,14 @@ SparrowProxy supports Kubernetes deployment with minimal required manifests.
 
 ### Docker Image
 
-The Docker image is automatically built and pushed to `docker-registry.booyah.dev/sparrowproxy` via GitHub Actions on:
+The Docker image is automatically built and pushed to GitHub Container Registry (`ghcr.io/booyahdev/sparrowproxy`) via GitHub Actions on:
 - Push to `main` or `develop` branches
 - Tagged releases (`v*`)
 - Pull requests to `main`
 
 ### GitHub Actions Setup
 
-The automated build and push workflow does not require any additional repository secrets as the registry is publicly accessible.
+The automated build and push workflow uses GitHub's built-in `GITHUB_TOKEN` to authenticate with the GitHub Container Registry. No additional repository secrets are required.
 
 ## Security Notes
 
