@@ -63,6 +63,7 @@ type Service struct {
 	Hosts          []string        `yaml:"hosts"`
 	Routes         []string        `yaml:"routes"`
 	Upstreams      []Upstream      `yaml:"upstreams"`
+	Mode           string          `yaml:"mode"` // Add mode field for load balancing
 	HealthCheck    Health          `yaml:"health_check"`
 	PassHostHeader *bool           `yaml:"pass_host_header"`
 	CircuitBreaker *CircuitBreaker `yaml:"circuit_breaker,omitempty"`
@@ -79,8 +80,7 @@ type CircuitBreaker struct {
 }
 
 type Upstream struct {
-	URL  string `yaml:"url"`
-	Mode string `yaml:"mode"` // Add mode field to specify connection mode
+	URL string `yaml:"url"`
 }
 
 type Health struct {
@@ -169,40 +169,42 @@ func (l *lb) nextAlive(mode string) *backend {
 	}
 
 	currentTime := time.Now().UnixMilli()
-	var fallbackBackend *backend
 
 	if mode == "priority" {
-		// Priority mode: Always try backends in order
+		// Priority mode: Always try backends in order, use first available
 		for _, b := range l.backends {
 			if b.alive.Load() && !l.isCircuitBreakerOpen(b, currentTime) {
+				log.Printf("Priority mode: Selected backend %s (first available)", b.target.String())
 				return b
 			}
-			if fallbackBackend == nil {
-				fallbackBackend = b
-			}
 		}
+		// If no healthy backends available, return first backend as fallback
+		log.Printf("Priority mode: No healthy backends available, using first backend as fallback: %s", l.backends[0].target.String())
+		return l.backends[0]
 	} else {
 		// Default to random mode
+		var fallbackBackend *backend
 		for attempts := uint32(0); attempts < n*2; attempts++ {
 			idx := l.idx.Add(1)
 			b := l.backends[idx%n]
 
 			if b.alive.Load() && !l.isCircuitBreakerOpen(b, currentTime) {
+				log.Printf("Random mode: Selected backend %s", b.target.String())
 				return b
 			}
 			if fallbackBackend == nil {
 				fallbackBackend = b
 			}
 		}
-	}
 
-	if fallbackBackend != nil {
-		log.Printf("No healthy backends available, using fallback: %s", fallbackBackend.target.String())
-		return fallbackBackend
-	}
+		if fallbackBackend != nil {
+			log.Printf("Random mode: No healthy backends available, using fallback: %s", fallbackBackend.target.String())
+			return fallbackBackend
+		}
 
-	log.Printf("All backends down, using first backend as last resort")
-	return l.backends[0]
+		log.Printf("Random mode: All backends down, using first backend as last resort")
+		return l.backends[0]
+	}
 }
 
 func (l *lb) isCircuitBreakerOpen(b *backend, currentTime int64) bool {
@@ -764,6 +766,13 @@ func (p *proxyServer) applyConfig(c *Config) error {
 			return err
 		}
 		p.lbs[s.Name] = l
+
+		// Log the load balancing mode for this service
+		mode := s.Mode
+		if mode == "" {
+			mode = "random"
+		}
+		log.Printf("Service %s: Load balancing mode set to '%s'", s.Name, mode)
 	}
 
 	p.certMap = make(map[string]*tls.Certificate)
@@ -868,7 +877,11 @@ func (p *proxyServer) directorFor(s *Service) func(*http.Request) {
 		}
 
 		lb := p.lbs[s.Name]
-		b := lb.nextAlive("random") // Specify mode explicitly
+		mode := s.Mode
+		if mode == "" {
+			mode = "random" // デフォルトはrandom
+		}
+		b := lb.nextAlive(mode)
 
 		if b == nil {
 			log.Printf("No backends available for service %s", s.Name)
@@ -956,6 +969,7 @@ type retryRoundTripper struct {
 	lb             *lb
 	maxRetries     int
 	passHostHeader bool
+	mode           string // Add mode field
 }
 
 func (rt *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error) {
@@ -966,16 +980,35 @@ func (rt *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 	for attempt := 0; attempt <= rt.maxRetries; attempt++ {
 		// 新しいbackendを選択
 		var selectedBackend *backend
-		for retryCount := 0; retryCount < len(rt.lb.backends)*2; retryCount++ {
-			b := rt.lb.nextAlive("random") // Specify mode explicitly for retry logic
-			if b == nil {
-				break
+
+		if rt.mode == "priority" {
+			// Priority mode: Try backends in order, but skip already used ones
+			for _, b := range rt.lb.backends {
+				backendKey := b.target.String()
+				if !usedBackends[backendKey] {
+					currentTime := time.Now().UnixMilli()
+					if b.alive.Load() && !rt.lb.isCircuitBreakerOpen(b, currentTime) {
+						selectedBackend = b
+						usedBackends[backendKey] = true
+						break
+					}
+					// Record this backend as tried even if unhealthy
+					usedBackends[backendKey] = true
+				}
 			}
-			backendKey := b.target.String()
-			if !usedBackends[backendKey] {
-				selectedBackend = b
-				usedBackends[backendKey] = true
-				break
+		} else {
+			// Random mode: Try to find an unused backend
+			for retryCount := 0; retryCount < len(rt.lb.backends)*2; retryCount++ {
+				b := rt.lb.nextAlive(rt.mode)
+				if b == nil {
+					break
+				}
+				backendKey := b.target.String()
+				if !usedBackends[backendKey] {
+					selectedBackend = b
+					usedBackends[backendKey] = true
+					break
+				}
 			}
 		}
 
@@ -1109,6 +1142,9 @@ func (p *proxyServer) transport() *http.Transport {
 		IdleConnTimeout:       90 * time.Second,
 		TLSHandshakeTimeout:   10 * time.Second,
 		ExpectContinueTimeout: 1 * time.Second,
+		TLSClientConfig: &tls.Config{
+			InsecureSkipVerify: true,
+		},
 	}
 }
 
@@ -1125,6 +1161,12 @@ func (p *proxyServer) makeProxy(s *Service) *httputil.ReverseProxy {
 		passHost = *s.PassHostHeader
 	}
 
+	// Mode設定を取得
+	mode := s.Mode
+	if mode == "" {
+		mode = "random" // デフォルトはrandom
+	}
+
 	loadBalancer := p.lbs[s.Name]
 
 	// カスタムトランスポートを作成（リトライ機能付き）
@@ -1135,8 +1177,9 @@ func (p *proxyServer) makeProxy(s *Service) *httputil.ReverseProxy {
 			lb:             loadBalancer,
 			maxRetries:     maxRetries,
 			passHostHeader: passHost,
+			mode:           mode,
 		}
-		log.Printf("Service %s: Retry enabled with max_retries=%d", s.Name, maxRetries)
+		log.Printf("Service %s: Retry enabled with max_retries=%d, mode=%s", s.Name, maxRetries, mode)
 	}
 
 	rp := &httputil.ReverseProxy{
@@ -1219,7 +1262,14 @@ func (p *proxyServer) startHealthChecks(ctx context.Context) {
 			timeout = 1 * time.Second
 		}
 
-		client := &http.Client{Timeout: timeout}
+		client := &http.Client{
+			Timeout: timeout,
+			Transport: &http.Transport{
+				TLSClientConfig: &tls.Config{
+					InsecureSkipVerify: true,
+				},
+			},
+		}
 		lb := p.lbs[s.Name]
 
 		go func(serviceName string) {
