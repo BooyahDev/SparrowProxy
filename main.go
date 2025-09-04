@@ -79,7 +79,8 @@ type CircuitBreaker struct {
 }
 
 type Upstream struct {
-	URL string `yaml:"url"`
+	URL  string `yaml:"url"`
+	Mode string `yaml:"mode"` // Add mode field to specify connection mode
 }
 
 type Health struct {
@@ -161,7 +162,7 @@ func newLB(name string, ups []Upstream, circuitBreaker *CircuitBreaker) (*lb, er
 	}, nil
 }
 
-func (l *lb) nextAlive() *backend {
+func (l *lb) nextAlive(mode string) *backend {
 	n := uint32(len(l.backends))
 	if n == 0 {
 		return nil
@@ -170,43 +171,37 @@ func (l *lb) nextAlive() *backend {
 	currentTime := time.Now().UnixMilli()
 	var fallbackBackend *backend
 
-	// 最大2周回してでも健全なbackendを探す
-	for attempts := uint32(0); attempts < n*2; attempts++ {
-		idx := l.idx.Add(1)
-		b := l.backends[idx%n]
-
-		// ヘルスチェックで生きていることが確認されている
-		if b.alive.Load() {
-			// Circuit Breakerが開いているかチェック
-			if l.isCircuitBreakerOpen(b, currentTime) {
-				// Circuit Breakerが開いているが、recovery timeを過ぎていればリトライを許可
-				if currentTime >= b.recoveryTime.Load() {
-					log.Printf("Backend %s: Circuit breaker half-open, allowing retry", b.target.String())
-					return b
-				}
-				// まだrecovery timeに達していない場合は、fallbackとして記憶しておく
-				if fallbackBackend == nil {
-					fallbackBackend = b
-				}
-				continue
+	if mode == "priority" {
+		// Priority mode: Always try backends in order
+		for _, b := range l.backends {
+			if b.alive.Load() && !l.isCircuitBreakerOpen(b, currentTime) {
+				return b
 			}
-			return b
+			if fallbackBackend == nil {
+				fallbackBackend = b
+			}
 		}
+	} else {
+		// Default to random mode
+		for attempts := uint32(0); attempts < n*2; attempts++ {
+			idx := l.idx.Add(1)
+			b := l.backends[idx%n]
 
-		// ヘルスチェックでダウンしているが、fallbackとして記憶
-		if fallbackBackend == nil {
-			fallbackBackend = b
+			if b.alive.Load() && !l.isCircuitBreakerOpen(b, currentTime) {
+				return b
+			}
+			if fallbackBackend == nil {
+				fallbackBackend = b
+			}
 		}
 	}
 
-	// 健全なbackendが見つからない場合
 	if fallbackBackend != nil {
-		log.Printf("No healthy backends available for service %s, using fallback: %s", l.name, fallbackBackend.target.String())
+		log.Printf("No healthy backends available, using fallback: %s", fallbackBackend.target.String())
 		return fallbackBackend
 	}
 
-	// 最後の手段として最初のbackendを返す
-	log.Printf("All backends down for service %s, using first backend as last resort", l.name)
+	log.Printf("All backends down, using first backend as last resort")
 	return l.backends[0]
 }
 
@@ -873,7 +868,7 @@ func (p *proxyServer) directorFor(s *Service) func(*http.Request) {
 		}
 
 		lb := p.lbs[s.Name]
-		b := lb.nextAlive()
+		b := lb.nextAlive("random") // Specify mode explicitly
 
 		if b == nil {
 			log.Printf("No backends available for service %s", s.Name)
@@ -972,7 +967,7 @@ func (rt *retryRoundTripper) RoundTrip(req *http.Request) (*http.Response, error
 		// 新しいbackendを選択
 		var selectedBackend *backend
 		for retryCount := 0; retryCount < len(rt.lb.backends)*2; retryCount++ {
-			b := rt.lb.nextAlive()
+			b := rt.lb.nextAlive("random") // Specify mode explicitly for retry logic
 			if b == nil {
 				break
 			}
@@ -1317,13 +1312,13 @@ func (p *proxyServer) httpsMux() http.Handler {
 		// パスの正規化を行うが、末尾のスラッシュは保持する
 		originalPath := r.URL.Path
 		normalizedPath := path.Clean(r.URL.Path)
-		
+
 		// path.Clean() が末尾のスラッシュを削除した場合で、元のパスが "/" で終わっていて、
 		// 正規化後が "/" 以外の場合は、末尾のスラッシュを復元する
 		if originalPath != "/" && strings.HasSuffix(originalPath, "/") && !strings.HasSuffix(normalizedPath, "/") {
 			normalizedPath += "/"
 		}
-		
+
 		if normalizedPath != originalPath {
 			log.Printf("Path normalized: %s -> %s", originalPath, normalizedPath)
 		}

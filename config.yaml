@@ -79,6 +79,7 @@ services:
   upstreams:
   - url: "http://backend1:8080"
   - url: "http://backend2:8080"
+  mode: "random" # or "priority"
   health_check:
     path: "/health"
     interval: "10s"
